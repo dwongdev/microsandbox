@@ -101,15 +101,18 @@ pub struct SandboxOpts {
     #[arg(long = "no-net")]
     pub no_net: bool,
 
-    /// Block DNS lookups for a domain (returns REFUSED).
+    /// Deny egress to a domain. Equivalent to a `deny Domain("...")`
+    /// policy rule appended after any `--net-rule` entries.
     #[cfg(feature = "net")]
-    #[arg(long)]
-    pub dns_block_domain: Vec<String>,
+    #[arg(long = "deny-domain", value_name = "NAME")]
+    pub deny_domain: Vec<String>,
 
-    /// Block DNS lookups for all subdomains of a suffix (e.g. .ads.com).
+    /// Deny egress to all subdomains of a suffix (e.g. `.ads.example`).
+    /// Equivalent to a `deny DomainSuffix("...")` rule appended after
+    /// any `--net-rule` entries.
     #[cfg(feature = "net")]
-    #[arg(long)]
-    pub dns_block_suffix: Vec<String>,
+    #[arg(long = "deny-domain-suffix", value_name = "SUFFIX")]
+    pub deny_domain_suffix: Vec<String>,
 
     /// Allow DNS responses pointing to private/internal IP addresses.
     #[cfg(feature = "net")]
@@ -243,8 +246,8 @@ impl SandboxOpts {
         #[cfg(feature = "net")]
         let net = !self.port.is_empty()
             || self.no_net
-            || !self.dns_block_domain.is_empty()
-            || !self.dns_block_suffix.is_empty()
+            || !self.deny_domain.is_empty()
+            || !self.deny_domain_suffix.is_empty()
             || self.no_dns_rebind_protection
             || !self.dns_nameserver.is_empty()
             || self.dns_query_timeout_ms.is_some()
@@ -422,8 +425,8 @@ fn apply_network_opts(
     }
 
     // DNS, TLS, and other network configuration.
-    let has_network_config = !opts.dns_block_domain.is_empty()
-        || !opts.dns_block_suffix.is_empty()
+    let has_network_config = !opts.deny_domain.is_empty()
+        || !opts.deny_domain_suffix.is_empty()
         || opts.no_dns_rebind_protection
         || !opts.dns_nameserver.is_empty()
         || opts.dns_query_timeout_ms.is_some()
@@ -442,8 +445,6 @@ fn apply_network_opts(
         || opts.on_secret_violation.is_some();
 
     if has_network_config {
-        let dns_block_domain = opts.dns_block_domain.clone();
-        let dns_block_suffix = opts.dns_block_suffix.clone();
         let no_dns_rebind = opts.no_dns_rebind_protection;
         let dns_nameservers = opts
             .dns_nameserver
@@ -455,6 +456,8 @@ fn apply_network_opts(
             &opts.net_rule,
             opts.net_default_egress.as_deref(),
             opts.net_default_ingress.as_deref(),
+            &opts.deny_domain,
+            &opts.deny_domain_suffix,
         )?;
         let max_conn = opts.max_connections;
         let trust_host_cas = opts.trust_host_cas;
@@ -468,31 +471,18 @@ fn apply_network_opts(
         let violation_action = parse_violation_action(&opts.on_secret_violation)?;
 
         builder = builder.network(move |mut n| {
-            let has_dns = !dns_block_domain.is_empty()
-                || !dns_block_suffix.is_empty()
-                || no_dns_rebind
-                || !dns_nameservers.is_empty()
-                || dns_query_timeout_ms.is_some();
-            if has_dns {
-                n = n.dns(move |mut d| {
-                    for domain in &dns_block_domain {
-                        d = d.block_domain(domain);
-                    }
-                    for suffix in &dns_block_suffix {
-                        d = d.block_domain_suffix(suffix);
-                    }
-                    if no_dns_rebind {
-                        d = d.rebind_protection(false);
-                    }
-                    if !dns_nameservers.is_empty() {
-                        d = d.nameservers(dns_nameservers);
-                    }
-                    if let Some(ms) = dns_query_timeout_ms {
-                        d = d.query_timeout_ms(ms);
-                    }
-                    d
-                });
-            }
+            n = n.dns(move |mut d| {
+                if no_dns_rebind {
+                    d = d.rebind_protection(false);
+                }
+                if !dns_nameservers.is_empty() {
+                    d = d.nameservers(dns_nameservers);
+                }
+                if let Some(ms) = dns_query_timeout_ms {
+                    d = d.query_timeout_ms(ms);
+                }
+                d
+            });
             if let Some(policy) = network_policy {
                 n = n.policy(policy);
             }
@@ -567,28 +557,43 @@ pub fn parse_duration_secs(s: &str) -> anyhow::Result<u64> {
     }
 }
 
-/// Assemble a [`NetworkPolicy`] from the new `--net-rule` /
-/// `--net-default-egress` / `--net-default-ingress` flag set, or
-/// `None` if no flag was set (caller falls back to the sandbox
-/// default).
-///
-/// Multiple `--net-rule` invocations concatenate in argv order; tokens
-/// inside each value are comma-separated and likewise preserved.
+/// Assemble a [`NetworkPolicy`] from `--net-rule` / `--net-default-*`
+/// and the bulk-deny flags. Returns `None` when no flag is set.
+/// Multiple `--net-rule` invocations concatenate in argv order.
 #[cfg(feature = "net")]
 fn build_network_policy(
     rule_args: &[String],
     default_egress: Option<&str>,
     default_ingress: Option<&str>,
+    deny_domains: &[String],
+    deny_domain_suffixes: &[String],
 ) -> anyhow::Result<Option<microsandbox_network::policy::NetworkPolicy>> {
-    use microsandbox_network::policy::{Action, NetworkPolicy};
+    use anyhow::Context;
+    use microsandbox_network::policy::{Action, Destination, DomainName, NetworkPolicy, Rule};
 
     use crate::net_rule::parse_rule_list;
 
-    if rule_args.is_empty() && default_egress.is_none() && default_ingress.is_none() {
+    let no_rule_flags =
+        rule_args.is_empty() && default_egress.is_none() && default_ingress.is_none();
+    let no_block_flags = deny_domains.is_empty() && deny_domain_suffixes.is_empty();
+    if no_rule_flags && no_block_flags {
         return Ok(None);
     }
 
     let mut rules = Vec::new();
+
+    // Prepend bulk-deny flags so they outrank later allow rules.
+    for d in deny_domains {
+        let domain: DomainName = d.parse().with_context(|| format!("--deny-domain {d:?}"))?;
+        rules.push(Rule::deny_egress(Destination::Domain(domain)));
+    }
+    for s in deny_domain_suffixes {
+        let suffix: DomainName = s
+            .parse()
+            .with_context(|| format!("--deny-domain-suffix {s:?}"))?;
+        rules.push(Rule::deny_egress(Destination::DomainSuffix(suffix)));
+    }
+
     for arg in rule_args {
         let parsed = parse_rule_list(arg).map_err(anyhow::Error::from)?;
         rules.extend(parsed);
@@ -602,16 +607,23 @@ fn build_network_policy(
         }
     };
 
-    // When the user sets no defaults explicitly, preserve today's
-    // asymmetric behavior: egress = Deny (rules open things);
-    // ingress = Allow (unfiltered published-port behavior).
+    // When the user sets no defaults explicitly, fall through to
+    // NetworkPolicy::public_only's defaults so behaviour stays in sync
+    // with the preset.
+    //
+    // Exception: if only --deny-domain / --deny-domain-suffix were set
+    // (no --net-rule, no --net-default-*), default egress flips to
+    // Allow so the rest of the network keeps working — these flags
+    // add deny entries on top of permissive defaults.
+    let preset = NetworkPolicy::public_only();
     let default_egress = match default_egress {
         Some(raw) => parse_action("--net-default-egress", raw)?,
-        None => Action::Deny,
+        None if no_rule_flags => Action::Allow,
+        None => preset.default_egress,
     };
     let default_ingress = match default_ingress {
         Some(raw) => parse_action("--net-default-ingress", raw)?,
-        None => Action::Allow,
+        None => preset.default_ingress,
     };
 
     Ok(Some(NetworkPolicy {

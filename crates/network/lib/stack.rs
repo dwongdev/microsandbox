@@ -28,7 +28,7 @@ use crate::dns::{
     proxies::{dot::DotProxy, tcp::DnsTcpProxy},
 };
 use crate::icmp_relay::IcmpRelay;
-use crate::policy::{NetworkPolicy, Protocol};
+use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
 use crate::proxy;
 use crate::publisher::PortPublisher;
 use crate::shared::SharedState;
@@ -298,10 +298,17 @@ pub fn smoltcp_poll_loop(
                             tracing::debug!(%dst, "alternative-DNS TCP port refused; stub should fall back to TCP/53");
                             false
                         }
-                        // Other: regular outbound — apply egress policy.
-                        DnsPortType::Other => network_policy
-                            .evaluate_egress(dst, Protocol::Tcp, &shared)
-                            .is_allow(),
+                        // Other: regular outbound — defer Domain rules to first-flight;
+                        // accept unless an IP-layer rule denies.
+                        DnsPortType::Other => match network_policy.evaluate_egress_with_source(
+                            dst,
+                            Protocol::Tcp,
+                            &shared,
+                            HostnameSource::Deferred,
+                        ) {
+                            EgressEvaluation::Allow | EgressEvaluation::DeferUntilHostname => true,
+                            EgressEvaluation::Deny => false,
+                        },
                     };
                     if allow && !conn_tracker.has_socket_for(&src, &dst) {
                         conn_tracker.create_tcp_socket(src, dst, &mut sockets);
@@ -418,6 +425,7 @@ pub fn smoltcp_poll_loop(
                     conn.to_smoltcp,
                     shared.clone(),
                     tls_state.clone(),
+                    network_policy.clone(),
                 );
                 continue;
             }
@@ -461,13 +469,15 @@ pub fn smoltcp_poll_loop(
                 continue;
             }
             // Plain TCP proxy.
-            let dst = resolve_host_dst(conn.dst, config.gateway);
+            let connect_dst = resolve_host_dst(conn.dst, config.gateway);
             proxy::spawn_tcp_proxy(
                 &tokio_handle,
-                dst,
+                conn.dst,
+                connect_dst,
                 conn.from_smoltcp,
                 conn.to_smoltcp,
                 shared.clone(),
+                network_policy.clone(),
             );
         }
 

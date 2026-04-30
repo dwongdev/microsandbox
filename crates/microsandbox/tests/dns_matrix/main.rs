@@ -141,10 +141,12 @@ async fn dns_matrix_dot() {
 //--------------------------------------------------------------------------------------------------
 
 /// Apply the network config shared by both sandboxes: the deny-resolver
-/// policy and the DNS block list (exact + suffix).
+/// policy plus deny rules for the test block list.
 fn with_policy_and_block_list(n: NetworkBuilder, policy: NetworkPolicy) -> NetworkBuilder {
-    n.policy(policy).dns(|d| {
-        d.block_domain(BLOCKED_EXACT)
-            .block_domain_suffix(BLOCKED_SUFFIX)
-    })
+    let policy = policy
+        .deny_domain(BLOCKED_EXACT)
+        .expect("BLOCKED_EXACT parses")
+        .deny_domain_suffix(BLOCKED_SUFFIX)
+        .expect("BLOCKED_SUFFIX parses");
+    n.policy(policy)
 }

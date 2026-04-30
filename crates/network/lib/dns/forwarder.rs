@@ -41,10 +41,10 @@ use tokio::sync::{OnceCell, watch};
 
 use super::client::{build_direct_client, build_tcp_client, build_udp_client};
 use super::common::config::NormalizedDnsConfig;
-use super::common::filter::{is_domain_blocked, is_private_ipv4, is_private_ipv6};
+use super::common::filter::{is_private_ipv4, is_private_ipv6};
 use super::common::transport::Transport;
 use super::nameserver::{read_host_dns_servers, resolve_nameservers};
-use crate::policy::NetworkPolicy;
+use crate::policy::{DomainName, NetworkPolicy};
 use crate::shared::{ResolvedHostnameFamily, SharedState};
 use crate::stack::GatewayIps;
 
@@ -160,9 +160,11 @@ impl DnsForwarder {
         let domain = question.name().to_string();
         let domain = domain.trim_end_matches('.').to_owned();
 
-        // Block list: synthesize REFUSED.
-        if is_domain_blocked(&domain, &self.config) {
-            tracing::debug!(domain = %domain, "DNS query blocked by domain policy");
+        // Refuse queries denied by the network policy.
+        if let Ok(canonical) = domain.parse::<DomainName>()
+            && self.network_policy.dns_query_denied(&canonical)
+        {
+            tracing::debug!(domain = %domain, "DNS query refused by network policy");
             return build_status_response(&query_msg, ResponseCode::Refused);
         }
 

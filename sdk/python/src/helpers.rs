@@ -364,9 +364,35 @@ fn apply_network(
     mut builder: microsandbox::sandbox::SandboxBuilder,
     net: &Bound<'_, PyDict>,
 ) -> PyResult<microsandbox::sandbox::SandboxBuilder> {
+    // Parse bulk deny-Domain rules up-front so PyValueError propagates
+    // cleanly rather than being swallowed inside the builder closure.
+    let mut bulk_deny_rules: Vec<microsandbox_network::policy::Rule> = Vec::new();
+
+    if let Some(domains) = extract_opt::<Vec<String>>(net, "deny_domains")? {
+        for d in domains {
+            let domain = d.parse().map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("deny_domains[{d:?}]: {e}"))
+            })?;
+            bulk_deny_rules.push(microsandbox_network::policy::Rule::deny_egress(
+                microsandbox_network::policy::Destination::Domain(domain),
+            ));
+        }
+    }
+    if let Some(suffixes) = extract_opt::<Vec<String>>(net, "deny_domain_suffixes")? {
+        for s in suffixes {
+            let suffix = s.parse().map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("deny_domain_suffixes[{s:?}]: {e}"))
+            })?;
+            bulk_deny_rules.push(microsandbox_network::policy::Rule::deny_egress(
+                microsandbox_network::policy::Destination::DomainSuffix(suffix),
+            ));
+        }
+    }
+    let mut policy_set = false;
+
     // Check for preset policy string.
     if let Some(policy_str) = extract_opt::<String>(net, "policy")? {
-        let policy = match policy_str.as_str() {
+        let mut policy = match policy_str.as_str() {
             "none" => NetworkPolicy::none(),
             "public_only" | "public-only" => NetworkPolicy::public_only(),
             "allow_all" | "allow-all" => NetworkPolicy::allow_all(),
@@ -376,7 +402,11 @@ fn apply_network(
                 )));
             }
         };
+        let mut combined = bulk_deny_rules.clone();
+        combined.extend(policy.rules);
+        policy.rules = combined;
         builder = builder.network(|n| n.policy(policy));
+        policy_set = true;
     }
 
     // Check for custom policy object.
@@ -526,22 +556,35 @@ fn apply_network(
             }
         }
 
+        let mut combined = bulk_deny_rules.clone();
+        combined.extend(rules);
         let policy = NetworkPolicy {
             default_egress,
             default_ingress,
-            rules,
+            rules: combined,
+        };
+        builder = builder.network(|n| n.policy(policy));
+        policy_set = true;
+    }
+
+    // No preset / custom policy was specified, but legacy DNS block
+    // entries were. Use permissive defaults so the rest of the network
+    // keeps working — preserves the legacy "full network minus blocked
+    // domains" semantics.
+    if !policy_set && !bulk_deny_rules.is_empty() {
+        let policy = NetworkPolicy {
+            default_egress: microsandbox_network::policy::Action::Allow,
+            default_ingress: microsandbox_network::policy::Action::Allow,
+            rules: bulk_deny_rules,
         };
         builder = builder.network(|n| n.policy(policy));
     }
 
-    // DNS configuration (nested `dns` dict).
     if let Some(dns) = net.get_item("dns")?
         && !dns.is_none()
     {
         let dns = as_dict(&dns)?;
 
-        let block_domains = extract_opt::<Vec<String>>(&dns, "blocked_domains")?;
-        let block_suffixes = extract_opt::<Vec<String>>(&dns, "blocked_suffixes")?;
         let rebind = extract_opt::<bool>(&dns, "rebind_protection")?;
         let nameservers_raw = extract_opt::<Vec<String>>(&dns, "nameservers")?;
         let query_timeout_ms = extract_opt::<u64>(&dns, "query_timeout_ms")?;
@@ -555,16 +598,6 @@ fn apply_network(
 
         builder = builder.network(move |n| {
             n.dns(move |mut d| {
-                if let Some(domains) = block_domains {
-                    for item in &domains {
-                        d = d.block_domain(item);
-                    }
-                }
-                if let Some(suffixes) = block_suffixes {
-                    for item in &suffixes {
-                        d = d.block_domain_suffix(item);
-                    }
-                }
                 if let Some(r) = rebind {
                     d = d.rebind_protection(r);
                 }

@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use crate::shared::SharedState;
 
 use super::destination::{matches_cidr, matches_group};
-use super::name::DomainName;
+use super::name::{DomainName, DomainNameError};
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -206,6 +206,44 @@ pub struct PortRange {
     pub end: u16,
 }
 
+/// Source of the hostname used to match `Domain` / `DomainSuffix`
+/// rules during an egress evaluation.
+#[derive(Debug, Clone, Copy)]
+pub enum HostnameSource<'a> {
+    /// Hostname from a TLS ClientHello, canonicalized.
+    Sni(&'a str),
+    /// No SNI — match `Domain` rules via the resolved-hostname cache.
+    CacheOnly,
+    /// SYN time, before SNI is known. A matching `Domain` /
+    /// `DomainSuffix` rule short-circuits to
+    /// [`EgressEvaluation::DeferUntilHostname`].
+    Deferred,
+}
+
+impl HostnameSource<'_> {
+    /// Short label for tracing tags (`"sni"`, `"cache"`, `"deferred"`).
+    pub fn label(&self) -> &'static str {
+        match self {
+            HostnameSource::Sni(_) => "sni",
+            HostnameSource::CacheOnly => "cache",
+            HostnameSource::Deferred => "deferred",
+        }
+    }
+}
+
+/// Outcome of an egress evaluation. Like [`Action`] plus a deferred
+/// state reachable only under [`HostnameSource::Deferred`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EgressEvaluation {
+    /// Permit the connection.
+    Allow,
+    /// Refuse the connection.
+    Deny,
+    /// First match was a Domain / DomainSuffix rule and the SNI isn't
+    /// known yet — accept the SYN and re-evaluate at first-flight.
+    DeferUntilHostname,
+}
+
 //--------------------------------------------------------------------------------------------------
 // Methods
 //--------------------------------------------------------------------------------------------------
@@ -267,43 +305,75 @@ impl NetworkPolicy {
         protocol: Protocol,
         shared: &SharedState,
     ) -> Action {
-        for rule in &self.rules {
-            if !matches!(rule.direction, Direction::Egress | Direction::Any) {
-                continue;
-            }
-            if !rule_matches(rule, dst.ip(), Some(dst.port()), protocol, shared) {
-                continue;
-            }
-            return rule.action;
-        }
-        self.default_egress
+        self.egress_walk(
+            dst.ip(),
+            Some(dst.port()),
+            protocol,
+            shared,
+            HostnameSource::CacheOnly,
+        )
+        .into()
     }
 
-    /// Evaluate an outbound ICMP packet against the rule list.
-    ///
-    /// Same as [`Self::evaluate_egress`] but without port matching —
-    /// ICMP has no ports. Rules with a non-empty `ports` filter are
-    /// skipped since applying a port range to a portless protocol would
-    /// be semantically incorrect.
+    /// Evaluate an outbound ICMP packet against the rule list. Like
+    /// [`Self::evaluate_egress`] but skips rules with a port filter
+    /// (ICMP has no ports).
     pub fn evaluate_egress_ip(
         &self,
         dst: IpAddr,
         protocol: Protocol,
         shared: &SharedState,
     ) -> Action {
+        self.egress_walk(dst, None, protocol, shared, HostnameSource::CacheOnly)
+            .into()
+    }
+
+    /// Evaluate an outbound connection with an explicit
+    /// [`HostnameSource`] for `Domain` / `DomainSuffix` matching.
+    /// Walk order and protocol/port filtering are identical across
+    /// sources — only the Domain match predicate varies.
+    pub fn evaluate_egress_with_source(
+        &self,
+        dst: SocketAddr,
+        protocol: Protocol,
+        shared: &SharedState,
+        source: HostnameSource<'_>,
+    ) -> EgressEvaluation {
+        self.egress_walk(dst.ip(), Some(dst.port()), protocol, shared, source)
+    }
+
+    /// Shared rule walk for the egress public methods. `port = None`
+    /// is the ICMP path; rules with a port filter are skipped there.
+    fn egress_walk(
+        &self,
+        addr: IpAddr,
+        port: Option<u16>,
+        protocol: Protocol,
+        shared: &SharedState,
+        source: HostnameSource<'_>,
+    ) -> EgressEvaluation {
         for rule in &self.rules {
             if !matches!(rule.direction, Direction::Egress | Direction::Any) {
                 continue;
             }
+            if !rule.protocols.is_empty() && !rule.protocols.contains(&protocol) {
+                continue;
+            }
             if !rule.ports.is_empty() {
-                continue;
+                let Some(p) = port else {
+                    continue;
+                };
+                if !rule.ports.iter().any(|range| range.contains(p)) {
+                    continue;
+                }
             }
-            if !rule_matches(rule, dst, None, protocol, shared) {
-                continue;
+            match matches_destination_with_source(&rule.destination, addr, shared, source) {
+                DestinationMatch::Match => return rule.action.into(),
+                DestinationMatch::Defer => return EgressEvaluation::DeferUntilHostname,
+                DestinationMatch::NoMatch => continue,
             }
-            return rule.action;
         }
-        self.default_egress
+        self.default_egress.into()
     }
 
     /// Evaluate an inbound connection against the rule list.
@@ -332,6 +402,123 @@ impl NetworkPolicy {
         }
         self.default_ingress
     }
+
+    /// True if any rule references a `Domain` or `DomainSuffix`
+    /// destination. The TCP proxy uses this to skip its SNI peek when
+    /// no rule could possibly need a hostname for evaluation.
+    pub fn has_domain_rules(&self) -> bool {
+        self.rules.iter().any(|r| {
+            matches!(
+                r.destination,
+                Destination::Domain(_) | Destination::DomainSuffix(_)
+            )
+        })
+    }
+
+    /// Should the DNS forwarder refuse a query for `name`?
+    ///
+    /// Returns `true` iff the first matching Domain / DomainSuffix
+    /// rule has action `Deny`. Port and protocol filters and
+    /// `default_egress` are not consulted — only explicit deny rules
+    /// refuse a query.
+    pub fn dns_query_denied(&self, name: &DomainName) -> bool {
+        for rule in &self.rules {
+            if !matches!(rule.direction, Direction::Egress | Direction::Any) {
+                continue;
+            }
+            let matched = match &rule.destination {
+                Destination::Domain(d) => name.as_str() == d.as_str(),
+                Destination::DomainSuffix(s) => matches_suffix(name.as_str(), s.as_str()),
+                _ => false,
+            };
+            if matched {
+                return rule.action == Action::Deny;
+            }
+        }
+        false
+    }
+
+    /// Single-name sugar over [`Self::deny_domains`].
+    pub fn deny_domain<S: AsRef<str>>(self, name: S) -> Result<Self, DomainNameError> {
+        self.deny_domains([name])
+    }
+
+    /// Single-name sugar over [`Self::allow_domains`].
+    pub fn allow_domain<S: AsRef<str>>(self, name: S) -> Result<Self, DomainNameError> {
+        self.allow_domains([name])
+    }
+
+    /// Single-suffix sugar over [`Self::deny_domain_suffixes`].
+    pub fn deny_domain_suffix<S: AsRef<str>>(self, suffix: S) -> Result<Self, DomainNameError> {
+        self.deny_domain_suffixes([suffix])
+    }
+
+    /// Single-suffix sugar over [`Self::allow_domain_suffixes`].
+    pub fn allow_domain_suffix<S: AsRef<str>>(self, suffix: S) -> Result<Self, DomainNameError> {
+        self.allow_domain_suffixes([suffix])
+    }
+
+    /// Prepend `deny Domain(name)` egress rules. Prepending lets the
+    /// deny outrank catch-all allows like `allow Public`.
+    pub fn deny_domains<I, S>(self, names: I) -> Result<Self, DomainNameError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.prepend_egress_rules(names, |d| Rule::deny_egress(Destination::Domain(d)))
+    }
+
+    /// Prepend `allow Domain(name)` egress rules.
+    pub fn allow_domains<I, S>(self, names: I) -> Result<Self, DomainNameError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.prepend_egress_rules(names, |d| Rule::allow_egress(Destination::Domain(d)))
+    }
+
+    /// Prepend `deny DomainSuffix(suffix)` egress rules. Suffixes
+    /// match the apex and any subdomain (label-aligned).
+    pub fn deny_domain_suffixes<I, S>(self, suffixes: I) -> Result<Self, DomainNameError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.prepend_egress_rules(suffixes, |d| {
+            Rule::deny_egress(Destination::DomainSuffix(d))
+        })
+    }
+
+    /// Prepend `allow DomainSuffix(suffix)` egress rules.
+    pub fn allow_domain_suffixes<I, S>(self, suffixes: I) -> Result<Self, DomainNameError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.prepend_egress_rules(suffixes, |d| {
+            Rule::allow_egress(Destination::DomainSuffix(d))
+        })
+    }
+
+    fn prepend_egress_rules<I, S, F>(
+        mut self,
+        names: I,
+        mk_rule: F,
+    ) -> Result<Self, DomainNameError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+        F: Fn(DomainName) -> Rule,
+    {
+        let mut new_rules = Vec::new();
+        for name in names {
+            let domain: DomainName = name.as_ref().parse()?;
+            new_rules.push(mk_rule(domain));
+        }
+        new_rules.extend(std::mem::take(&mut self.rules));
+        self.rules = new_rules;
+        Ok(self)
+    }
 }
 
 impl Action {
@@ -353,6 +540,34 @@ impl Action {
     /// Helper for `#[serde(default)]` — returns [`Action::Deny`].
     pub fn deny() -> Self {
         Action::Deny
+    }
+}
+
+impl From<Action> for EgressEvaluation {
+    fn from(action: Action) -> Self {
+        match action {
+            Action::Allow => EgressEvaluation::Allow,
+            Action::Deny => EgressEvaluation::Deny,
+        }
+    }
+}
+
+impl From<EgressEvaluation> for Action {
+    /// `DeferUntilHostname` is unreachable here (only the SYN handler
+    /// asks for deferral, and it doesn't request an `Action`). Debug
+    /// builds panic; release falls back to `Deny`.
+    fn from(eval: EgressEvaluation) -> Self {
+        match eval {
+            EgressEvaluation::Allow => Action::Allow,
+            EgressEvaluation::Deny => Action::Deny,
+            EgressEvaluation::DeferUntilHostname => {
+                debug_assert!(
+                    false,
+                    "EgressEvaluation::DeferUntilHostname leaked through a CacheOnly/Sni evaluator"
+                );
+                Action::Deny
+            }
+        }
     }
 }
 
@@ -456,19 +671,73 @@ fn rule_matches(
     matches_destination(&rule.destination, addr, shared)
 }
 
-/// Check if an IP address matches a destination specification.
-fn matches_destination(dest: &Destination, addr: IpAddr, shared: &SharedState) -> bool {
-    match dest {
-        Destination::Any => true,
-        Destination::Cidr(network) => matches_cidr(network, addr),
-        Destination::Group(group) => matches_group(*group, addr, shared),
-        Destination::Domain(domain) => {
-            shared.any_resolved_hostname(addr, |hostname| hostname == domain.as_str())
-        }
-        Destination::DomainSuffix(suffix) => {
-            shared.any_resolved_hostname(addr, |hostname| matches_suffix(hostname, suffix.as_str()))
+/// Internal three-state result for [`matches_destination_with_source`].
+/// `Defer` is reachable only when the source is
+/// [`HostnameSource::Deferred`] and the destination is `Domain` or
+/// `DomainSuffix`.
+enum DestinationMatch {
+    Match,
+    NoMatch,
+    Defer,
+}
+
+impl From<bool> for DestinationMatch {
+    fn from(matched: bool) -> Self {
+        if matched {
+            DestinationMatch::Match
+        } else {
+            DestinationMatch::NoMatch
         }
     }
+}
+
+/// Check if an IP / hostname source matches a destination specification.
+///
+/// IP-based destinations (`Any`, `Cidr`, `Group`) ignore `source` since
+/// they decide on the address alone. `Domain` / `DomainSuffix` consult
+/// `source`:
+///
+/// - [`HostnameSource::Sni`]: byte-equality against the canonicalized
+///   SNI string (or label-aware suffix match).
+/// - [`HostnameSource::CacheOnly`]: query the resolved-hostname cache
+///   on `shared` for any prior resolution of `addr` that matches.
+/// - [`HostnameSource::Deferred`]: short-circuits to
+///   [`DestinationMatch::Defer`].
+fn matches_destination_with_source(
+    dest: &Destination,
+    addr: IpAddr,
+    shared: &SharedState,
+    source: HostnameSource<'_>,
+) -> DestinationMatch {
+    match dest {
+        Destination::Any => DestinationMatch::Match,
+        Destination::Cidr(network) => matches_cidr(network, addr).into(),
+        Destination::Group(group) => matches_group(*group, addr, shared).into(),
+        Destination::Domain(domain) => match source {
+            HostnameSource::Sni(name) => (name == domain.as_str()).into(),
+            HostnameSource::CacheOnly => shared
+                .any_resolved_hostname(addr, |hostname| hostname == domain.as_str())
+                .into(),
+            HostnameSource::Deferred => DestinationMatch::Defer,
+        },
+        Destination::DomainSuffix(suffix) => match source {
+            HostnameSource::Sni(name) => matches_suffix(name, suffix.as_str()).into(),
+            HostnameSource::CacheOnly => shared
+                .any_resolved_hostname(addr, |hostname| matches_suffix(hostname, suffix.as_str()))
+                .into(),
+            HostnameSource::Deferred => DestinationMatch::Defer,
+        },
+    }
+}
+
+/// Cache-only destination match used by the ingress evaluator. Wraps
+/// [`matches_destination_with_source`] with [`HostnameSource::CacheOnly`]
+/// since ingress has no SNI concept.
+fn matches_destination(dest: &Destination, addr: IpAddr, shared: &SharedState) -> bool {
+    matches!(
+        matches_destination_with_source(dest, addr, shared, HostnameSource::CacheOnly),
+        DestinationMatch::Match,
+    )
 }
 
 /// Label-aware suffix match on pre-canonicalized strings.
@@ -1079,5 +1348,444 @@ mod tests {
         assert!(egress_tcp(&policy, "127.0.0.1", &shared).is_deny());
         // Metadata is not in Public.
         assert!(egress_tcp(&policy, "169.254.169.254", &shared).is_deny());
+    }
+
+    //----------------------------------------------------------------------------------------------
+    // dns_query_denied
+    //----------------------------------------------------------------------------------------------
+
+    fn deny_domain_policy(dest: Destination) -> NetworkPolicy {
+        NetworkPolicy {
+            default_egress: Action::Allow,
+            default_ingress: Action::Allow,
+            rules: vec![Rule::deny_egress(dest)],
+        }
+    }
+
+    fn name(s: &str) -> DomainName {
+        s.parse().expect("valid domain name")
+    }
+
+    #[test]
+    fn dns_query_denied_matches_exact_domain() {
+        let policy = deny_domain_policy(Destination::Domain(name("evil.com")));
+        assert!(policy.dns_query_denied(&name("evil.com")));
+        assert!(!policy.dns_query_denied(&name("good.com")));
+    }
+
+    #[test]
+    fn dns_query_denied_matches_suffix_apex_and_subdomain() {
+        let policy = deny_domain_policy(Destination::DomainSuffix(name(".evil.com")));
+        assert!(
+            policy.dns_query_denied(&name("evil.com")),
+            "apex must match"
+        );
+        assert!(
+            policy.dns_query_denied(&name("foo.evil.com")),
+            "subdomain must match"
+        );
+        assert!(
+            policy.dns_query_denied(&name("deep.sub.evil.com")),
+            "deeper subdomain must match"
+        );
+    }
+
+    #[test]
+    fn dns_query_denied_does_not_match_disjoint_suffix() {
+        let policy = deny_domain_policy(Destination::DomainSuffix(name(".evil.com")));
+        assert!(!policy.dns_query_denied(&name("notevil.com")));
+    }
+
+    #[test]
+    fn dns_query_denied_ignores_cidr_group_any_rules() {
+        let policy = NetworkPolicy {
+            default_egress: Action::Allow,
+            default_ingress: Action::Allow,
+            rules: vec![
+                Rule::deny_egress(Destination::Any),
+                Rule::deny_egress(Destination::Cidr("10.0.0.0/8".parse().unwrap())),
+                Rule::deny_egress(Destination::Group(DestinationGroup::Public)),
+            ],
+        };
+        assert!(!policy.dns_query_denied(&name("anything.example")));
+    }
+
+    #[test]
+    fn dns_query_denied_first_match_wins_when_allow_precedes_deny() {
+        let policy = NetworkPolicy {
+            default_egress: Action::Allow,
+            default_ingress: Action::Allow,
+            rules: vec![
+                Rule::allow_egress(Destination::Domain(name("evil.com"))),
+                Rule::deny_egress(Destination::DomainSuffix(name(".evil.com"))),
+            ],
+        };
+        // Allow rule comes first; DNS resolution must proceed.
+        assert!(!policy.dns_query_denied(&name("evil.com")));
+        // Deny suffix still catches subdomains the allow rule didn't cover.
+        assert!(policy.dns_query_denied(&name("foo.evil.com")));
+    }
+
+    #[test]
+    fn dns_query_denied_ignores_port_and_protocol_filters() {
+        // A narrow rule (only TCP/443) must still refuse DNS — DNS does
+        // not carry a destination port.
+        let policy = NetworkPolicy {
+            default_egress: Action::Allow,
+            default_ingress: Action::Allow,
+            rules: vec![Rule {
+                direction: Direction::Egress,
+                destination: Destination::Domain(name("evil.com")),
+                protocols: vec![Protocol::Tcp],
+                ports: vec![PortRange::single(443)],
+                action: Action::Deny,
+            }],
+        };
+        assert!(policy.dns_query_denied(&name("evil.com")));
+    }
+
+    #[test]
+    fn dns_query_denied_ignores_default_egress() {
+        // Deny-by-default with no Domain rules: DNS proceeds.
+        let policy = NetworkPolicy {
+            default_egress: Action::Deny,
+            default_ingress: Action::Allow,
+            rules: vec![],
+        };
+        assert!(!policy.dns_query_denied(&name("anything.example")));
+    }
+
+    #[test]
+    fn dns_query_denied_skips_ingress_only_rules() {
+        let policy = NetworkPolicy {
+            default_egress: Action::Allow,
+            default_ingress: Action::Allow,
+            rules: vec![Rule::deny_ingress(Destination::Domain(name("evil.com")))],
+        };
+        assert!(!policy.dns_query_denied(&name("evil.com")));
+    }
+
+    #[test]
+    fn dns_query_denied_any_direction_rule_applies() {
+        let policy = NetworkPolicy {
+            default_egress: Action::Allow,
+            default_ingress: Action::Allow,
+            rules: vec![Rule::deny_any(Destination::Domain(name("evil.com")))],
+        };
+        assert!(policy.dns_query_denied(&name("evil.com")));
+    }
+
+    //----------------------------------------------------------------------------------------------
+    // evaluate_egress_with_source / HostnameSource
+    //----------------------------------------------------------------------------------------------
+
+    /// Cache says IP X corresponds to `evil.com`; policy allows
+    /// `pypi.org`; SNI says `pypi.org`. SNI must take precedence over
+    /// the cache and the connection must be allowed. (Fixes over-block.)
+    #[test]
+    fn hostname_source_sni_ignores_dns_cache() {
+        let shared = shared_with_host("evil.com", PYPI_V4);
+        let policy = allow_rule(Destination::Domain(name("pypi.org")));
+        let eval = policy.evaluate_egress_with_source(
+            sock(PYPI_V4, 443),
+            Protocol::Tcp,
+            &shared,
+            HostnameSource::Sni("pypi.org"),
+        );
+        assert_eq!(eval, EgressEvaluation::Allow);
+    }
+
+    /// Cache says IP X corresponds to `pypi.org`; policy allows
+    /// `pypi.org`; SNI says `evil.com`. The cache would over-allow,
+    /// but SNI is authoritative — connection denied. (Fixes over-allow.)
+    #[test]
+    fn hostname_source_sni_denies_when_cache_would_allow() {
+        let shared = shared_with_host("pypi.org", PYPI_V4);
+        let policy = allow_rule(Destination::Domain(name("pypi.org")));
+        let eval = policy.evaluate_egress_with_source(
+            sock(PYPI_V4, 443),
+            Protocol::Tcp,
+            &shared,
+            HostnameSource::Sni("evil.com"),
+        );
+        assert_eq!(eval, EgressEvaluation::Deny);
+    }
+
+    /// Deferred mode: a matching `Domain` rule short-circuits the walk
+    /// with `DeferUntilHostname` regardless of the rule's action.
+    #[test]
+    fn deferred_returns_defer_for_first_matching_domain_rule() {
+        let shared = SharedState::new(4);
+        let policy = NetworkPolicy {
+            default_egress: Action::Deny,
+            default_ingress: Action::Allow,
+            rules: vec![Rule::allow_egress(Destination::Domain(name("pypi.org")))],
+        };
+        let eval = policy.evaluate_egress_with_source(
+            sock(PYPI_V4, 443),
+            Protocol::Tcp,
+            &shared,
+            HostnameSource::Deferred,
+        );
+        assert_eq!(eval, EgressEvaluation::DeferUntilHostname);
+    }
+
+    /// An earlier matching IP-layer allow wins before the deferred
+    /// Domain rule is reached — SYN proceeds without deferral.
+    #[test]
+    fn deferred_returns_allow_for_earlier_matching_cidr_allow() {
+        let shared = SharedState::new(4);
+        let policy = NetworkPolicy {
+            default_egress: Action::Deny,
+            default_ingress: Action::Allow,
+            rules: vec![
+                Rule::allow_egress(Destination::Cidr("151.101.0.0/16".parse().unwrap())),
+                Rule::allow_egress(Destination::Domain(name("pypi.org"))),
+            ],
+        };
+        let eval = policy.evaluate_egress_with_source(
+            sock(PYPI_V4, 443),
+            Protocol::Tcp,
+            &shared,
+            HostnameSource::Deferred,
+        );
+        assert_eq!(eval, EgressEvaluation::Allow);
+    }
+
+    /// An earlier matching IP-layer deny wins before any Domain rule —
+    /// SYN dropped at the IP layer.
+    #[test]
+    fn deferred_returns_deny_for_earlier_matching_cidr_deny() {
+        let shared = SharedState::new(4);
+        let policy = NetworkPolicy {
+            default_egress: Action::Allow,
+            default_ingress: Action::Allow,
+            rules: vec![
+                Rule::deny_egress(Destination::Cidr("151.101.0.0/16".parse().unwrap())),
+                Rule::allow_egress(Destination::Domain(name("pypi.org"))),
+            ],
+        };
+        let eval = policy.evaluate_egress_with_source(
+            sock(PYPI_V4, 443),
+            Protocol::Tcp,
+            &shared,
+            HostnameSource::Deferred,
+        );
+        assert_eq!(eval, EgressEvaluation::Deny);
+    }
+
+    /// Domain rules pruned by the protocol or port filter never match
+    /// in `Deferred` mode — they don't trigger deferral, the walk falls
+    /// through to whatever comes next (here, the default action).
+    #[test]
+    fn deferred_skips_domain_rule_pruned_by_protocol_or_port_filter() {
+        let shared = SharedState::new(4);
+        let policy = NetworkPolicy {
+            default_egress: Action::Deny,
+            default_ingress: Action::Allow,
+            rules: vec![Rule {
+                direction: Direction::Egress,
+                destination: Destination::Domain(name("pypi.org")),
+                protocols: vec![Protocol::Udp], // wrong protocol
+                ports: vec![],
+                action: Action::Allow,
+            }],
+        };
+        let eval = policy.evaluate_egress_with_source(
+            sock(PYPI_V4, 443),
+            Protocol::Tcp,
+            &shared,
+            HostnameSource::Deferred,
+        );
+        assert_eq!(eval, EgressEvaluation::Deny);
+
+        let policy_port = NetworkPolicy {
+            default_egress: Action::Deny,
+            default_ingress: Action::Allow,
+            rules: vec![Rule {
+                direction: Direction::Egress,
+                destination: Destination::Domain(name("pypi.org")),
+                protocols: vec![],
+                ports: vec![PortRange::single(80)], // wrong port
+                action: Action::Allow,
+            }],
+        };
+        let eval = policy_port.evaluate_egress_with_source(
+            sock(PYPI_V4, 443),
+            Protocol::Tcp,
+            &shared,
+            HostnameSource::Deferred,
+        );
+        assert_eq!(eval, EgressEvaluation::Deny);
+    }
+
+    /// `evaluate_egress_with_source(CacheOnly)` reproduces the exact
+    /// behaviour of the back-compat `evaluate_egress` wrapper.
+    #[test]
+    fn cache_only_source_matches_evaluate_egress_wrapper() {
+        let shared = shared_with_host("pypi.org", PYPI_V4);
+        let policy = allow_rule(Destination::Domain(name("pypi.org")));
+        let dst = sock(PYPI_V4, 443);
+
+        let wrapper = policy.evaluate_egress(dst, Protocol::Tcp, &shared);
+        let with_source = policy.evaluate_egress_with_source(
+            dst,
+            Protocol::Tcp,
+            &shared,
+            HostnameSource::CacheOnly,
+        );
+        assert_eq!(wrapper, Action::Allow);
+        assert_eq!(with_source, EgressEvaluation::Allow);
+    }
+
+    /// `Sni` against a `DomainSuffix` rule: label-aware suffix match
+    /// applied directly to the SNI string, no cache consulted.
+    #[test]
+    fn hostname_source_sni_matches_domain_suffix() {
+        let shared = SharedState::new(4); // empty cache
+        let policy = allow_rule(Destination::DomainSuffix(name(".pythonhosted.org")));
+        let eval = policy.evaluate_egress_with_source(
+            sock(FILES_V4, 443),
+            Protocol::Tcp,
+            &shared,
+            HostnameSource::Sni("files.pythonhosted.org"),
+        );
+        assert_eq!(eval, EgressEvaluation::Allow);
+    }
+
+    /// `From<EgressEvaluation> for Action` debug-panics on
+    /// `DeferUntilHostname`; in release it falls back to `Deny`. The
+    /// debug panic is what makes the wrapper safe.
+    #[test]
+    #[should_panic(expected = "DeferUntilHostname")]
+    fn defer_through_action_conversion_debug_panics() {
+        let _: Action = EgressEvaluation::DeferUntilHostname.into();
+    }
+
+    //----------------------------------------------------------------------------------------------
+    // NetworkPolicy::deny_domains / deny_domain_suffixes (and allow_*)
+    //----------------------------------------------------------------------------------------------
+
+    #[test]
+    fn deny_domains_prepends_one_rule_per_name() {
+        let policy = NetworkPolicy {
+            default_egress: Action::Allow,
+            default_ingress: Action::Allow,
+            rules: vec![Rule::allow_egress(Destination::Group(
+                DestinationGroup::Public,
+            ))],
+        };
+        let policy = policy
+            .deny_domains(["evil.com", "tracker.example"])
+            .unwrap();
+        assert_eq!(policy.rules.len(), 3);
+        // Prepended in input order; existing allow Public moves to the back.
+        assert!(matches!(
+            &policy.rules[0],
+            Rule { action: Action::Deny, destination: Destination::Domain(d), .. }
+                if d.as_str() == "evil.com"
+        ));
+        assert!(matches!(
+            &policy.rules[1],
+            Rule { action: Action::Deny, destination: Destination::Domain(d), .. }
+                if d.as_str() == "tracker.example"
+        ));
+        assert!(matches!(
+            &policy.rules[2].destination,
+            Destination::Group(DestinationGroup::Public),
+        ));
+    }
+
+    /// Prepending matters: appended denies are shadowed by an earlier
+    /// `allow Public` rule when the denied domain resolves to a public
+    /// IP. Verifies the helper makes the deny actually fire.
+    #[test]
+    fn deny_domains_outranks_existing_allow_public() {
+        let shared = shared_with_host("evil.com", PYPI_V4);
+        let policy = NetworkPolicy::default().deny_domains(["evil.com"]).unwrap();
+        assert!(egress_tcp(&policy, PYPI_V4, &shared).is_deny());
+    }
+
+    #[test]
+    fn deny_domain_suffixes_prepends_suffix_rules() {
+        let policy = NetworkPolicy {
+            default_egress: Action::Allow,
+            default_ingress: Action::Allow,
+            rules: vec![],
+        };
+        let policy = policy.deny_domain_suffixes([".evil.com"]).unwrap();
+        assert!(matches!(
+            &policy.rules[0],
+            Rule {
+                action: Action::Deny,
+                destination: Destination::DomainSuffix(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn allow_domains_and_deny_domains_chain() {
+        let policy = NetworkPolicy::default()
+            .deny_domains(["evil.com"])
+            .unwrap()
+            .allow_domains(["pypi.org"])
+            .unwrap();
+        // Last call prepends, so allow pypi.org comes before deny evil.com.
+        assert!(matches!(
+            &policy.rules[0],
+            Rule { action: Action::Allow, destination: Destination::Domain(d), .. }
+                if d.as_str() == "pypi.org"
+        ));
+        assert!(matches!(
+            &policy.rules[1],
+            Rule { action: Action::Deny, destination: Destination::Domain(d), .. }
+                if d.as_str() == "evil.com"
+        ));
+    }
+
+    #[test]
+    fn deny_domains_invalid_input_returns_error() {
+        let result = NetworkPolicy::default().deny_domains(["not a domain!"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn deny_domains_empty_input_is_noop() {
+        let before = NetworkPolicy::default();
+        let after = before.clone().deny_domains(Vec::<&str>::new()).unwrap();
+        assert_eq!(after.rules.len(), before.rules.len());
+    }
+
+    #[test]
+    fn singular_domain_helpers_match_plural_one_element_form() {
+        let plural = NetworkPolicy::default().deny_domains(["evil.com"]).unwrap();
+        let singular = NetworkPolicy::default().deny_domain("evil.com").unwrap();
+        assert_eq!(plural.rules.len(), singular.rules.len());
+        assert!(matches!(
+            (&plural.rules[0], &singular.rules[0]),
+            (
+                Rule { destination: Destination::Domain(a), .. },
+                Rule { destination: Destination::Domain(b), .. },
+            ) if a == b
+        ));
+    }
+
+    #[test]
+    fn singular_domain_suffix_helper_chains() {
+        let policy = NetworkPolicy::default()
+            .deny_domain("evil.com")
+            .unwrap()
+            .deny_domain_suffix(".tracking.example")
+            .unwrap();
+        // Last call prepends, so the suffix rule sits at index 0.
+        assert!(matches!(
+            &policy.rules[0].destination,
+            Destination::DomainSuffix(_),
+        ));
+        assert!(matches!(
+            &policy.rules[1].destination,
+            Destination::Domain(_),
+        ));
     }
 }
