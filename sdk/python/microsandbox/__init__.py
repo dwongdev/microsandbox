@@ -123,6 +123,7 @@ from microsandbox.types import (
     Secret,
     SecretEntry,
     SecretInjection,
+    SecurityProfile,
     Size,
     StatVirtualization,
     Stdin,
@@ -232,6 +233,7 @@ __all__ = [
     "PullPolicy",
     "RegistryAuth",
     "LogLevel",
+    "SecurityProfile",
     "LogSource",
     "LogReadSource",
     # Patches

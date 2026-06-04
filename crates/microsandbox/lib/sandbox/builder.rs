@@ -1,25 +1,26 @@
 //! Fluent builder for [`SandboxConfig`].
 
+#[cfg(feature = "net")]
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use microsandbox_image::{PullPolicy, PullProgressHandle, RegistryAuth};
 #[cfg(feature = "net")]
 use microsandbox_network::builder::{NetworkBuilder, SecretBuilder};
 #[cfg(feature = "net")]
 use microsandbox_network::config::{PortProtocol, PublishedPort};
-#[cfg(feature = "net")]
-use std::net::{IpAddr, Ipv4Addr};
 
 use super::{
     config::SandboxConfig,
     exec::{Rlimit, RlimitResource},
     init::{HandoffInit, InitOptionsBuilder},
     types::{
-        ImageBuilder, IntoImage, MountBuilder, Patch, PatchBuilder, RootfsSource, VolumeMount,
+        ImageBuilder, IntoImage, MountBuilder, Patch, PatchBuilder, RootfsSource, SecurityProfile,
+        VolumeMount,
     },
 };
 use crate::{LogLevel, MicrosandboxError, MicrosandboxResult, size::Mebibytes};
-use std::time::Duration;
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -559,7 +560,16 @@ impl SandboxBuilder {
     /// Can be called multiple times. Per-command env vars (on exec/shell)
     /// are merged on top.
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.config.env.push((key.into(), value.into()));
+        let key = key.into();
+        if key.starts_with("MSB_") {
+            if self.build_error.is_none() {
+                self.build_error = Some(crate::MicrosandboxError::InvalidConfig(format!(
+                    "environment variable {key:?} uses the reserved MSB_ prefix"
+                )));
+            }
+            return self;
+        }
+        self.config.env.push((key, value.into()));
         self
     }
 
@@ -569,7 +579,7 @@ impl SandboxBuilder {
         vars: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
     ) -> Self {
         for (k, v) in vars {
-            self.config.env.push((k.into(), v.into()));
+            self = self.env(k, v);
         }
         self
     }
@@ -647,6 +657,12 @@ impl SandboxBuilder {
     /// Inactivity is detected via agentd heartbeat. Omit to disable (default).
     pub fn idle_timeout(mut self, secs: u64) -> Self {
         self.config.policy.idle_timeout_secs = Some(secs);
+        self
+    }
+
+    /// Set the in-guest security profile.
+    pub fn security(mut self, profile: SecurityProfile) -> Self {
+        self.config.security_profile = profile;
         self
     }
 
@@ -882,6 +898,7 @@ impl SandboxBuilder {
         }
 
         super::types::validate_volume_mounts(&self.config.mounts)?;
+        super::validate_env(&self.config.env)?;
 
         if let Some(spec) = &self.config.init {
             super::init::validate(spec)?;
@@ -1308,6 +1325,18 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("env_var must not contain NUL"));
+    }
+
+    #[tokio::test]
+    async fn test_builder_rejects_reserved_msb_env_key() {
+        let err = SandboxBuilder::new("test")
+            .image("alpine")
+            .env("MSB_SECURITY_PROFILE", "default")
+            .build()
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("uses the reserved MSB_ prefix"));
     }
 
     //----------------------------------------------------------------------------------------------

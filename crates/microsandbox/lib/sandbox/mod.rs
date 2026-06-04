@@ -104,7 +104,8 @@ pub use ssh::{
 };
 pub use types::{
     DiskImageFormat, HostPermissions, ImageBuilder, ImageSource, IntoImage, MountBuilder,
-    MountOptions, Patch, PatchBuilder, RootfsSource, StatVirtualization, VolumeMount,
+    MountOptions, Patch, PatchBuilder, RootfsSource, SecurityProfile, StatVirtualization,
+    VolumeMount,
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -246,6 +247,7 @@ impl Sandbox {
         validate_sandbox_name_for_runtime(&config.name)?;
         validate_rootfs_source(&config.image)?;
         types::validate_volume_mounts(&config.mounts)?;
+        validate_env(&config.env)?;
         validate_labels(&config.labels)?;
 
         // Initialize the database before any expensive image pull so we can
@@ -467,6 +469,7 @@ impl Sandbox {
         validate_sandbox_name_for_runtime(&config.name)?;
         validate_rootfs_source(&config.image)?;
         types::validate_volume_mounts(&config.mounts)?;
+        validate_env(&config.env)?;
         validate_labels(&config.labels)?;
         validate_start_state(&config, &crate::config::config().sandboxes_dir().join(name))?;
         update_sandbox_status(write_db, model.id, SandboxStatus::Running).await?;
@@ -2002,6 +2005,17 @@ fn validate_labels(labels: &HashMap<String, String>) -> MicrosandboxResult<()> {
         if let Some(prefix) = reserved_label_prefix(key) {
             return Err(MicrosandboxError::InvalidConfig(format!(
                 "label key '{key}' uses reserved prefix '{prefix}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_env(env: &[(String, String)]) -> MicrosandboxResult<()> {
+    for (key, _) in env {
+        if key.starts_with("MSB_") {
+            return Err(MicrosandboxError::InvalidConfig(format!(
+                "environment variable {key:?} uses the reserved MSB_ prefix"
             )));
         }
     }

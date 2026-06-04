@@ -134,6 +134,7 @@ export interface NapiSandboxBuilderSetters {
   disableMetricsSample(): this;
   workdir(path: string): this;
   shell(shell: string): this;
+  security(profile: "default" | "restricted"): this;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   registry(configure: (b: any) => any): this;
   replace(): this;
@@ -894,6 +895,8 @@ export interface NapiMountBuilder {
   fstype(fstype: string): this;
   readonly(): this;
   noexec(): this;
+  nosuid(): this;
+  nodev(): this;
   size(mib: number): this;
   statVirtualization(policy: string): this;
   hostPermissions(policy: string): this;
@@ -905,6 +908,8 @@ export interface NapiVolumeMount {
   readonly guest: string;
   readonly readonly: boolean;
   readonly noexec: boolean;
+  readonly nosuid: boolean;
+  readonly nodev: boolean;
   readonly host?: string;
   readonly name?: string;
   readonly sizeMib?: number;
