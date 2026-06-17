@@ -55,6 +55,9 @@ use self::exec::{ExecHandle, ExecOptions};
 /// Maximum UTF-8 byte length for a sandbox name.
 pub const MAX_SANDBOX_NAME_BYTES: usize = microsandbox_metrics::SLOT_NAME_BYTES;
 
+/// Maximum UTF-8 byte length for a guest hostname (Linux `__NEW_UTS_LEN`).
+pub const MAX_HOSTNAME_BYTES: usize = 64;
+
 /// Prefixes reserved for built-in identity/resource attributes.
 pub(crate) const RESERVED_LABEL_PREFIXES: [&str; 3] = ["sandbox.", "microsandbox.", "service."];
 
@@ -71,6 +74,28 @@ pub fn validate_sandbox_name(name: &str) -> MicrosandboxResult<()> {
 pub(super) fn validate_sandbox_name_for_runtime(name: &str) -> MicrosandboxResult<()> {
     validate_sandbox_name(name)?;
     crate::runtime::resolve_sandbox_agent_socket_path(name).map(|_| ())
+}
+
+/// Validate an explicit guest hostname before it is forwarded to agentd.
+pub(super) fn validate_hostname(hostname: Option<&str>) -> MicrosandboxResult<()> {
+    let Some(hostname) = hostname else {
+        return Ok(());
+    };
+
+    if hostname.is_empty() {
+        return Err(crate::MicrosandboxError::InvalidConfig(
+            "hostname must not be empty".into(),
+        ));
+    }
+
+    let len = hostname.len();
+    if len > MAX_HOSTNAME_BYTES {
+        return Err(crate::MicrosandboxError::InvalidConfig(format!(
+            "hostname is too long: {len} bytes (max {MAX_HOSTNAME_BYTES})"
+        )));
+    }
+
+    Ok(())
 }
 
 pub(crate) fn sandbox_name_validation_message(name: &str) -> Option<String> {
@@ -444,6 +469,8 @@ pub(crate) async fn create_local(
     let mut pinned_reference: Option<String> = None;
 
     config.apply_runtime_defaults();
+    validate_sandbox_name_for_runtime(&config.name)?;
+    validate_hostname(config.hostname.as_deref())?;
     validate_rootfs_source(&config.image)?;
     validate_env(&config.env)?;
     validate_labels(&config.labels)?;
@@ -634,6 +661,8 @@ pub(crate) async fn start_local(
 
     let mut config: SandboxConfig = serde_json::from_str(&model.config)?;
     config.apply_runtime_defaults();
+    validate_sandbox_name_for_runtime(&config.name)?;
+    validate_hostname(config.hostname.as_deref())?;
     validate_rootfs_source(&config.image)?;
     validate_env(&config.env)?;
     validate_labels(&config.labels)?;
@@ -1920,6 +1949,35 @@ fn pid_is_dead_or_reaped(pid: i32) -> bool {
     !pid_is_alive(pid)
 }
 
+/// Derive a guest hostname from a sandbox name, fitting within
+/// [`MAX_HOSTNAME_BYTES`]. Names short enough pass through unchanged;
+/// longer names collapse to a deterministic `<prefix>-<hash>` form to
+/// keep distinct long names very unlikely to share a hostname.
+pub(crate) fn hostname_from_sandbox_name(name: &str) -> String {
+    if name.len() <= MAX_HOSTNAME_BYTES {
+        return name.to_string();
+    }
+
+    // 55-byte prefix + '-' + 8 hex chars of sha256 = 64 bytes.
+    const HASH_HEX_LEN: usize = 8;
+    const PREFIX_MAX: usize = MAX_HOSTNAME_BYTES - 1 - HASH_HEX_LEN;
+
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(name.as_bytes());
+    let digest = hasher.finalize();
+    let suffix = format!(
+        "{:02x}{:02x}{:02x}{:02x}",
+        digest[0], digest[1], digest[2], digest[3]
+    );
+
+    let mut end = PREFIX_MAX;
+    while end > 0 && !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}-{}", &name[..end], suffix)
+}
+
 /// Pull an OCI image and return the pull result.
 ///
 /// Auth resolution:
@@ -2440,6 +2498,7 @@ mod tests {
         os::fd::{AsRawFd, FromRawFd, OwnedFd},
         path::PathBuf,
         process::Command,
+        sync::Arc,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -2452,9 +2511,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        RootfsSource, SandboxConfig, SandboxStatus, insert_sandbox_record,
-        persist_oci_manifest_pin, prepare_create_target, reconcile_sandbox_runtime_state,
-        remove_dir_if_exists, validate_rootfs_source,
+        MAX_HOSTNAME_BYTES, MAX_SANDBOX_NAME_BYTES, RootfsSource, SandboxConfig, SandboxStatus,
+        hostname_from_sandbox_name, insert_sandbox_record, persist_oci_manifest_pin,
+        prepare_create_target, reconcile_sandbox_runtime_state, remove_dir_if_exists,
+        validate_hostname, validate_rootfs_source,
     };
 
     /// Open both pools at `db_path` for tests, with migrations applied.
@@ -2597,6 +2657,114 @@ mod tests {
         validate_rootfs_source(&RootfsSource::Bind(path.clone())).unwrap();
 
         fs::remove_dir(path).unwrap();
+    }
+
+    #[test]
+    fn test_hostname_from_sandbox_name_passes_short_names_through() {
+        let name = "short-name";
+        assert_eq!(hostname_from_sandbox_name(name), name);
+
+        let name = "a".repeat(MAX_HOSTNAME_BYTES);
+        assert_eq!(hostname_from_sandbox_name(&name), name);
+    }
+
+    #[test]
+    fn test_hostname_from_sandbox_name_collapses_long_names_to_64_bytes() {
+        let derived = hostname_from_sandbox_name(&"a".repeat(MAX_HOSTNAME_BYTES + 1));
+        assert_eq!(derived.len(), MAX_HOSTNAME_BYTES);
+
+        let derived = hostname_from_sandbox_name(&"a".repeat(MAX_SANDBOX_NAME_BYTES));
+        assert_eq!(derived.len(), MAX_HOSTNAME_BYTES);
+
+        let bytes = derived.as_bytes();
+        assert_eq!(bytes[MAX_HOSTNAME_BYTES - 9], b'-');
+        assert!(
+            bytes[MAX_HOSTNAME_BYTES - 8..]
+                .iter()
+                .all(u8::is_ascii_hexdigit)
+        );
+    }
+
+    #[test]
+    fn test_hostname_from_sandbox_name_is_deterministic_and_unique() {
+        let a = "a".repeat(MAX_SANDBOX_NAME_BYTES);
+        let mut b = a.clone();
+        b.pop();
+        b.push('b');
+
+        assert_eq!(
+            hostname_from_sandbox_name(&a),
+            hostname_from_sandbox_name(&a)
+        );
+        assert_ne!(
+            hostname_from_sandbox_name(&a),
+            hostname_from_sandbox_name(&b)
+        );
+    }
+
+    #[test]
+    fn test_hostname_from_sandbox_name_respects_utf8_boundaries() {
+        let name = "é".repeat(64);
+        assert_eq!(name.len(), 128);
+
+        let derived = hostname_from_sandbox_name(&name);
+        assert!(derived.len() <= MAX_HOSTNAME_BYTES);
+        assert!(derived.is_char_boundary(derived.len()));
+    }
+
+    #[test]
+    fn test_validate_hostname_accepts_absent_and_64_byte_hostname() {
+        validate_hostname(None).unwrap();
+        validate_hostname(Some(&"y".repeat(MAX_HOSTNAME_BYTES))).unwrap();
+    }
+
+    #[test]
+    fn test_validate_hostname_rejects_empty_hostname() {
+        let err = validate_hostname(Some("")).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid config: hostname must not be empty"
+        );
+    }
+
+    #[test]
+    fn test_validate_hostname_rejects_over_64_byte_hostname() {
+        let err = validate_hostname(Some(&"y".repeat(MAX_HOSTNAME_BYTES + 1))).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid config: hostname is too long: 65 bytes (max 64)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_local_rejects_invalid_hostname_before_rootfs_validation() {
+        let temp = tempdir().unwrap();
+        let backend = Arc::new(
+            crate::backend::LocalBackend::builder()
+                .home(temp.path())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let config = SandboxConfig {
+            name: "test".into(),
+            image: RootfsSource::Bind(unique_temp_path("missing")),
+            hostname: Some("y".repeat(MAX_HOSTNAME_BYTES + 1)),
+            ..Default::default()
+        };
+
+        let err =
+            match super::create_local(backend, config, crate::runtime::SpawnMode::Attached, None)
+                .await
+            {
+                Ok(_) => panic!("invalid hostname should fail before sandbox creation"),
+                Err(err) => err,
+            };
+
+        assert_eq!(
+            err.to_string(),
+            "invalid config: hostname is too long: 65 bytes (max 64)"
+        );
     }
 
     #[test]

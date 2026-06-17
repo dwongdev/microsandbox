@@ -192,7 +192,7 @@ pub struct SandboxOpts {
     #[arg(long = "init-env", value_name = "KEY=VALUE", requires = "init")]
     pub init_env: Vec<String>,
 
-    /// Set the guest hostname (defaults to sandbox name).
+    /// Set the guest hostname (defaults to a sandbox-name-derived hostname).
     #[arg(short = 'H', long)]
     pub hostname: Option<String>,
 

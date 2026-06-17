@@ -168,7 +168,7 @@ pub struct SandboxConfig {
     #[serde(default)]
     pub cmd: Option<Vec<String>>,
 
-    /// Guest hostname. Defaults to the sandbox name.
+    /// Guest hostname. Defaults to a sandbox-name-derived hostname.
     #[serde(default)]
     pub hostname: Option<String>,
 
