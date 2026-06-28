@@ -564,14 +564,14 @@ pub async fn spawn_sandbox(
     tracing::debug!(pid = _pid, sandbox = %config.spec.name, "spawn_sandbox: process started");
 
     #[cfg(windows)]
-    if let Some(job) = &child_job {
-        if let Err(err) = job.assign_pid(_pid) {
-            let status = terminate_startup_process(&mut child).await;
-            release_metrics_reservation(config, metrics_reservation.as_ref());
-            return Err(crate::MicrosandboxError::Runtime(format!(
-                "failed to assign sandbox process to Windows job (status: {status:?}): {err}"
-            )));
-        }
+    if let Some(job) = &child_job
+        && let Err(err) = job.assign_pid(_pid)
+    {
+        let status = terminate_startup_process(&mut child).await;
+        release_metrics_reservation(config, metrics_reservation.as_ref());
+        return Err(crate::MicrosandboxError::Runtime(format!(
+            "failed to assign sandbox process to Windows job (status: {status:?}): {err}"
+        )));
     }
 
     let line = match tokio::time::timeout(
@@ -1526,7 +1526,7 @@ fn clear_cloexec(fd: i32) -> MicrosandboxResult<()> {
 }
 
 /// Return agent relay socket paths in preferred connection order.
-pub(crate) fn sandbox_agent_socket_path_candidates(name: &str) -> [PathBuf; 2] {
+pub(crate) fn sandbox_agent_socket_path_candidates(name: &str) -> Vec<PathBuf> {
     let (run_dir, sandboxes_dir) = crate::backend::default_backend()
         .as_local()
         .map(|local| (local.config().run_dir(), local.config().sandboxes_dir()))
@@ -1543,7 +1543,7 @@ pub(crate) fn sandbox_agent_socket_path_candidates(name: &str) -> [PathBuf; 2] {
 pub(crate) fn sandbox_agent_socket_path_candidates_for(
     local: &LocalBackend,
     name: &str,
-) -> [PathBuf; 2] {
+) -> Vec<PathBuf> {
     sandbox_agent_socket_path_candidates_with_roots(
         &local.config().run_dir(),
         &local.config().sandboxes_dir(),
@@ -1555,11 +1555,26 @@ fn sandbox_agent_socket_path_candidates_with_roots(
     run_dir: &Path,
     sandboxes_dir: &Path,
     name: &str,
-) -> [PathBuf; 2] {
-    [
-        sandbox_agent_socket_path(run_dir, name),
+) -> Vec<PathBuf> {
+    let primary = sandbox_agent_socket_path(run_dir, name);
+
+    // On Unix a long sandbox name or a deep MSB_HOME can overflow the AF_UNIX
+    // `sun_path` limit, so keep the legacy
+    // `<sandboxes>/<name>/runtime/agent.sock` path as a fallback. Windows named
+    // pipes have no such length limit and never shipped a pre-hash naming
+    // scheme, so the primary pipe is the only candidate.
+    #[cfg(unix)]
+    let candidates = vec![
+        primary,
         legacy_sandbox_agent_socket_path(sandboxes_dir, name),
-    ]
+    ];
+    #[cfg(not(unix))]
+    let candidates = {
+        let _ = sandboxes_dir;
+        vec![primary]
+    };
+
+    candidates
 }
 
 /// Pick the first explicit-backend socket path usable on this platform.
@@ -1577,8 +1592,9 @@ pub(crate) fn resolve_sandbox_agent_socket_path(name: &str) -> MicrosandboxResul
     resolve_sandbox_agent_socket_path_from_candidates(candidates)
 }
 
+#[cfg(unix)]
 fn resolve_sandbox_agent_socket_path_from_candidates(
-    candidates: [PathBuf; 2],
+    candidates: Vec<PathBuf>,
 ) -> MicrosandboxResult<PathBuf> {
     for path in &candidates {
         if sandbox_agent_socket_path_fits(path) {
@@ -1597,6 +1613,19 @@ fn resolve_sandbox_agent_socket_path_from_candidates(
          MSB_HOME or paths.sandboxes to a shorter directory",
         unix_socket_path_capacity()
     )))
+}
+
+#[cfg(not(unix))]
+fn resolve_sandbox_agent_socket_path_from_candidates(
+    candidates: Vec<PathBuf>,
+) -> MicrosandboxResult<PathBuf> {
+    // Named pipes have no `sun_path`-style length limit, so the primary
+    // candidate is always usable.
+    candidates.into_iter().next().ok_or_else(|| {
+        crate::MicrosandboxError::InvalidConfig(
+            "no agent relay socket candidates were derived".to_string(),
+        )
+    })
 }
 
 #[cfg(unix)]
@@ -1623,27 +1652,19 @@ fn agent_socket_hash(name: &str) -> String {
     hash
 }
 
+// The legacy `<sandboxes>/<name>/runtime/agent.sock` fallback only exists for
+// backward compatibility with the pre-hash Unix layout; Windows never shipped a
+// different agent-pipe scheme, so this is Unix-only.
 #[cfg(unix)]
 fn legacy_sandbox_agent_socket_path(sandboxes_dir: &Path, name: &str) -> PathBuf {
     sandboxes_dir.join(name).join("runtime").join("agent.sock")
 }
 
-#[cfg(windows)]
-fn legacy_sandbox_agent_socket_path(_sandboxes_dir: &Path, name: &str) -> PathBuf {
-    PathBuf::from(format!(
-        r"\\.\pipe\msb-agent-legacy-{}",
-        agent_socket_hash(name)
-    ))
-}
-
+// Agent socket path length only constrains AF_UNIX `sun_path` on Unix; Windows
+// named pipes have no equivalent limit, so these helpers are Unix-only.
 #[cfg(unix)]
 fn sandbox_agent_socket_path_fits(path: &Path) -> bool {
     sandbox_agent_socket_path_len(path) < unix_socket_path_capacity()
-}
-
-#[cfg(not(unix))]
-fn sandbox_agent_socket_path_fits(_path: &Path) -> bool {
-    true
 }
 
 #[cfg(unix)]
@@ -1651,20 +1672,10 @@ fn sandbox_agent_socket_path_len(path: &Path) -> usize {
     path.as_os_str().as_bytes().len()
 }
 
-#[cfg(not(unix))]
-fn sandbox_agent_socket_path_len(_path: &Path) -> usize {
-    0
-}
-
 #[cfg(unix)]
 fn unix_socket_path_capacity() -> usize {
     let storage = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
     storage.sun_path.len()
-}
-
-#[cfg(not(unix))]
-fn unix_socket_path_capacity() -> usize {
-    usize::MAX
 }
 
 async fn terminate_startup_process(
@@ -1749,7 +1760,7 @@ async fn stage_file_mounts(
                     "file mount: hard-linked"
                 );
             }
-            Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+            Err(e) if is_cross_device_link_error(&e) => {
                 if !readonly {
                     tracing::warn!(
                         host = %host.display(),
@@ -1773,6 +1784,29 @@ async fn stage_file_mounts(
     }
 
     Ok((staged, Some(tempdir)))
+}
+
+/// Return whether a host hard-link failed because the target is on another device.
+fn is_cross_device_link_error(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::CrossesDevices || is_platform_cross_device_link_error(error)
+}
+
+#[cfg(unix)]
+fn is_platform_cross_device_link_error(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::EXDEV)
+}
+
+#[cfg(windows)]
+fn is_platform_cross_device_link_error(error: &std::io::Error) -> bool {
+    // CreateHardLinkW reports cross-volume links as ERROR_NOT_SAME_DEVICE.
+    const ERROR_NOT_SAME_DEVICE: i32 = 17;
+
+    error.raw_os_error() == Some(ERROR_NOT_SAME_DEVICE)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_platform_cross_device_link_error(_error: &std::io::Error) -> bool {
+    false
 }
 
 /// Push a `--mount tag:host_path[:ro]` arg pair.
@@ -2913,14 +2947,15 @@ mod tests {
         let home = temp.path().join("msb-home");
         let backend = LocalBackend::builder().home(&home).build().await.unwrap();
 
-        let [hashed, legacy] =
+        let candidates =
             super::sandbox_agent_socket_path_candidates_for(&backend, "sdk-socket-test");
 
         #[cfg(unix)]
         {
-            assert!(hashed.starts_with(backend.config().run_dir().join("agent")));
+            assert_eq!(candidates.len(), 2);
+            assert!(candidates[0].starts_with(backend.config().run_dir().join("agent")));
             assert_eq!(
-                legacy,
+                candidates[1],
                 backend
                     .config()
                     .sandboxes_dir()
@@ -2931,21 +2966,30 @@ mod tests {
         }
         #[cfg(windows)]
         {
-            assert!(hashed.to_string_lossy().starts_with(r"\\.\pipe\msb-agent-"));
+            assert_eq!(candidates.len(), 1);
             assert!(
-                legacy
+                candidates[0]
                     .to_string_lossy()
-                    .starts_with(r"\\.\pipe\msb-agent-legacy-")
+                    .starts_with(r"\\.\pipe\msb-agent-")
             );
         }
     }
 
     #[tokio::test]
     async fn test_agent_socket_resolution_uses_explicit_local_backend_paths() {
+        // Root the backend home under a short directory so the derived AF_UNIX
+        // socket path stays within the platform `sun_path` limit (104 bytes on
+        // macOS). The default system temp dir on macOS lives under
+        // `/var/folders/...`, long enough to overflow that limit and make
+        // resolution fail spuriously. Windows uses named pipes (no length
+        // limit), so the default temp dir is fine there.
+        #[cfg(unix)]
         let temp = tempfile::Builder::new()
             .prefix("msb")
             .tempdir_in("/tmp")
             .unwrap();
+        #[cfg(not(unix))]
+        let temp = tempfile::Builder::new().prefix("msb").tempdir().unwrap();
         let home = temp.path().join("msb-home");
         let backend = LocalBackend::builder().home(&home).build().await.unwrap();
 
@@ -3403,6 +3447,70 @@ mod tests {
                 .windows(2)
                 .any(|pair| pair[0] == "--mount" && pair[1] == expected),
             "missing override-quota --mount arg in {rendered:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn test_sandbox_cli_args_windows_drive_bind_mount_preserves_drive_colon() {
+        let config = SandboxBuilder::new("test")
+            .image("/tmp/rootfs")
+            .volume("/data", |m| {
+                m.bind(r"C:\Users\Stephen\data")
+                    .readonly()
+                    .stat_virtualization(StatVirtualization::Relaxed)
+                    .host_permissions(HostPermissions::Mirror)
+            })
+            .build()
+            .await
+            .unwrap();
+
+        let rendered = render_args(&config);
+        let data_tag = super::guest_mount_tag("/data");
+        let expected = format!(
+            r"{data_tag}:C:\Users\Stephen\data:ro,stat-virt=relaxed,host-perms=mirror,quota={}",
+            crate::sandbox::config::DEFAULT_BIND_QUOTA_MIB
+        );
+
+        assert!(
+            rendered
+                .windows(2)
+                .any(|pair| pair[0] == "--mount" && pair[1] == expected),
+            "missing Windows drive bind --mount arg in {rendered:?}"
+        );
+        assert!(rendered.contains(&format!("MSB_DIR_MOUNTS={data_tag}:/data:ro")));
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn test_sandbox_cli_args_windows_drive_file_mount_preserves_drive_colon() {
+        let config = SandboxBuilder::new("test")
+            .image("/tmp/rootfs")
+            .volume("/guest/config.txt", |m| {
+                m.bind(r"C:\Users\Stephen\config.txt").readonly()
+            })
+            .build()
+            .await
+            .unwrap();
+
+        let mut staged_file_mounts = HashMap::new();
+        staged_file_mounts.insert(
+            "/guest/config.txt".to_string(),
+            (
+                PathBuf::from(r"C:\Users\Stephen\AppData\Local\Temp\msb\fm_deadbeef"),
+                "config.txt".to_string(),
+                "fm_deadbeef".to_string(),
+            ),
+        );
+
+        let rendered = render_args_with_file_mounts(&config, &staged_file_mounts);
+
+        assert!(rendered.windows(2).any(|pair| pair[0] == "--mount"
+            && pair[1] == r"fm_deadbeef:C:\Users\Stephen\AppData\Local\Temp\msb\fm_deadbeef:ro"));
+        assert!(
+            rendered.contains(
+                &"MSB_FILE_MOUNTS=fm_deadbeef:config.txt:/guest/config.txt:ro".to_string()
+            )
         );
     }
 
