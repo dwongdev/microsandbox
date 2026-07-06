@@ -137,9 +137,9 @@ msb restart worker
 
 ## Update a running sandbox
 
-`msb modify` and the SDK `modify()` methods change a sandbox's configuration in place: CPUs, memory, env vars, labels, workdir, and secrets. Every requested change is planned first and labeled `live`, `next start`, `requires restart`, or `unsupported`. Apply is all-or-nothing: if any change cannot be applied under the policy you chose, nothing changes.
+`msb modify` and the SDK `modify()` methods change a sandbox in place: CPUs, memory, env vars, labels, workdir, and secrets. Every change is planned first, and apply is all-or-nothing.
 
-CPU and memory changes apply live while the new values stay within the `max_cpus` / `max_memory` ceilings reserved at create time; raising a ceiling requires a restart. The ceilings default to the initial values, which leaves no headroom, so set them higher at create time if the sandbox may need to grow. Env and workdir changes affect future execs only; running processes keep their current environment.
+CPU and memory apply live while they stay within the `max_cpus` / `max_memory` ceilings chosen at create time. The ceilings default to the initial values, so set them higher at create time if the sandbox may need to grow.
 
 <CodeGroup>
 ```rust Rust
@@ -168,11 +168,9 @@ msb modify api --cpus 8 --dry-run   # show the plan, apply nothing
 ```
 </CodeGroup>
 
-Preview any change with a dry run before committing. When a change cannot apply live, pick a policy: next-start saves it for the next boot, restart makes it active now by restarting the sandbox (`--next-start` / `--restart` in the CLI, `policy` in the SDKs).
+Preview any change with a dry run, and pick a policy for changes that cannot apply live: `--next-start` saves them for the next boot, `--restart` applies them now (`policy` in the SDKs). Modifying a stopped sandbox never starts it.
 
-Modifying a stopped sandbox never starts it; the changes are saved and take effect on the next boot.
-
-See [`msb modify`](/cli/sandbox-commands#msb-modify) for all flags, and the SDK sandbox pages for the full API.
+See [`msb modify`](/cli/sandbox-commands#msb-modify) for all flags and caveats.
 
 ## Ping and touch
 
