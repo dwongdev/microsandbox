@@ -1336,7 +1336,7 @@ sb, err := m.CreateSandbox(ctx, "worker",
 
 </Accordion>
 
-Hand off PID 1 inside the guest to a custom init binary after agentd finishes boot-time setup. Construct `cfg` via the [`Init`](#init) factory. See [Custom init system](/sandboxes/customize#custom-init-system) for image picks and shutdown semantics.
+Hand off PID 1 inside the guest to a custom init binary after agentd finishes boot-time setup. Construct `cfg` via the [`Init`](#init) factory. See [Custom init system](/sandboxes/bootstrap#custom-init-system) for image picks and shutdown semantics.
 
 <p className="msb-label">Parameters</p>
 
@@ -1659,7 +1659,7 @@ Prevent [`EnsureInstalled`](#m-ensureinstalled) from fetching the msb + libkrunf
 
 ## Patch
 
-Factory that constructs rootfs patches for [`WithPatches`](#withpatches). Access via the package-level `Patch` value. Each method returns a [`PatchConfig`](#patchconfig). `Mkdir` and `Remove` are idempotent; other operations error at boot when targeting a path already present in the image unless `Replace: true` is passed in [`PatchOptions`](#patchoptions). See [Patches](/sandboxes/customize#patches) for conceptual context.
+Factory that constructs rootfs patches for [`WithPatches`](#withpatches). Access via the package-level `Patch` value. Each method returns a [`PatchConfig`](#patchconfig). `Mkdir` and `Remove` are idempotent; other operations error at boot when targeting a path already present in the image unless `Replace: true` is passed in [`PatchOptions`](#patchoptions). See [Patches](/sandboxes/bootstrap#patches) for conceptual context.
 
 #### <span className="msb-recv">Patch.</span><span className="msb-hn">Text()</span>
 
@@ -1822,7 +1822,7 @@ Recursively copy a host directory at `src` into the guest rootfs at `dst`. Only 
 
 ## Init
 
-Factory that constructs [`InitConfig`](#initconfig) values for [`WithInit`](#withinit), handing off PID 1 inside the guest after agentd setup. Access via the package-level `Init` value. See [Custom init system](/sandboxes/customize#custom-init-system) for image picks and shutdown semantics.
+Factory that constructs [`InitConfig`](#initconfig) values for [`WithInit`](#withinit), handing off PID 1 inside the guest after agentd setup. Access via the package-level `Init` value. See [Custom init system](/sandboxes/bootstrap#custom-init-system) for image picks and shutdown semantics.
 
 #### <span className="msb-recv">Init.</span><span className="msb-hn">Auto()</span>
 

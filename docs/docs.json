@@ -42,14 +42,14 @@
               "sandboxes/commands",
               "sandboxes/filesystem",
               "sandboxes/secrets",
-              "sandboxes/configuration",
+              "sandboxes/tuning",
               "sandboxes/ssh",
               "sandboxes/volumes",
               "sandboxes/snapshots",
               "sandboxes/labels",
               "sandboxes/logs",
               "sandboxes/metrics",
-              "sandboxes/customize"
+              "sandboxes/bootstrap"
             ]
           },
           {

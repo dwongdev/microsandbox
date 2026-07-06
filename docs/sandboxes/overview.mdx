@@ -119,7 +119,7 @@ msb create python --name worker \
 
 `max_cpus` and `max_memory` reserve live resize headroom. They default to the
 starting `cpus` and `memory` values, so set them higher when a sandbox may need
-to grow later. See [Config](/sandboxes/configuration) for the full change
+to grow later. See [Tuning](/sandboxes/tuning) for the full change
 model.
 
 Labels are arbitrary `key=value` metadata attached to a sandbox. They can be set
@@ -196,10 +196,10 @@ When replacing a running sandbox, microsandbox attempts graceful shutdown before
 ## Where to go next
 
 - [Lifecycle](/sandboxes/lifecycle): start, stop, detach, wait, and remove sandboxes
-- [Config](/sandboxes/configuration): change settings after create
+- [Tuning](/sandboxes/tuning): change settings after create
 - [Labels](/sandboxes/labels): organize, select, and attribute sandboxes
 - [Secrets](/sandboxes/secrets): inject credentials without exposing values
-- [Init](/sandboxes/customize): prepare scripts, patches, and PID 1
+- [Bootstrap](/sandboxes/bootstrap): prepare scripts, patches, and PID 1
 - [Commands](/sandboxes/commands): run commands and stream output
 - [Volumes](/sandboxes/volumes): persist or share data
 - [Networking](/networking/overview): control egress, ingress, DNS, and ports

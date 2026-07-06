@@ -1136,7 +1136,7 @@ const sandbox = await Sandbox.builder("worker")
 
 </Accordion>
 
-Hand off PID 1 inside the guest to `cmd` after agentd finishes its boot-time setup. `cmd` is either an absolute path inside the guest rootfs or the literal `"auto"`, which honors a known image ENTRYPOINT init then falls back to probing common init paths. See [Custom init system](/sandboxes/customize#custom-init-system). For init binaries that need extra env, use [`initWith`](#initwith).
+Hand off PID 1 inside the guest to `cmd` after agentd finishes its boot-time setup. `cmd` is either an absolute path inside the guest rootfs or the literal `"auto"`, which honors a known image ENTRYPOINT init then falls back to probing common init paths. See [Custom init system](/sandboxes/bootstrap#custom-init-system). For init binaries that need extra env, use [`initWith`](#initwith).
 
 <p className="msb-label">Parameters</p>
 
@@ -1739,7 +1739,7 @@ Set the default working directory for all commands.
 
 ## PatchBuilder
 
-Fluent builder for the ordered list of pre-boot rootfs patches. Used in `SandboxBuilder.patch(p => p...)`. Each method appends one operation; calls are chainable. By default a method that targets a path already present in the image errors at boot; pass `{ replace: true }` on the operation to allow overwriting. `mkdir` and `remove` are idempotent. See [Patches](/sandboxes/customize#patches) for conceptual context.
+Fluent builder for the ordered list of pre-boot rootfs patches. Used in `SandboxBuilder.patch(p => p...)`. Each method appends one operation; calls are chainable. By default a method that targets a path already present in the image errors at boot; pass `{ replace: true }` on the operation to allow overwriting. `mkdir` and `remove` are idempotent. See [Patches](/sandboxes/bootstrap#patches) for conceptual context.
 
 #### <span className="msb-recv">.</span><span className="msb-hn">append()</span>
 
