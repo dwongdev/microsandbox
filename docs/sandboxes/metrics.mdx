@@ -116,7 +116,7 @@ Fleet snapshots only include sandboxes whose runtime process is actually alive. 
 
 ## Metrics reports (Rust)
 
-The Rust SDK additionally exposes *reports*: metrics joined with catalog context for presentation. A report resolves the CPU and memory allocations from the sandbox's **active config** (so live resizes are reflected), and carries a state field: `Running`, `Stalled` (runtime alive but no sample within three sampling intervals), or `Exited` (the preserved terminal sample of a stopped sandbox). This is what `msb metrics` renders.
+The Rust SDK additionally exposes *reports*: metrics joined with catalog context for presentation. A report resolves the CPU and memory allocations from the sandbox's **active config**, so live resizes are reflected. It also carries a state field: `Running`, `Stalled` (runtime alive but no sample within three sampling intervals), or `Exited` (the preserved terminal sample of a stopped sandbox). This is what `msb metrics` renders.
 
 ```rust Rust
 use microsandbox::{all_sandbox_metrics_reports_local, sandbox_metrics_report_local};

@@ -23,10 +23,10 @@ Every metrics row now carries a `STATE`: `running`, `stalled` (runtime alive but
 
 **Resize-aware CPU and memory denominators**
 
-The `CPU` column shows cores busy over cores allocated (`0.80 / 2c`) and `MEM` shows usage over the configured limit — both resolved from the catalog's *active* config at read time, so `msb modify --cpus/--memory` on a running sandbox is reflected on the next tick instead of showing the boot-time limit forever.
+The `CPU` column shows cores busy over cores allocated (`0.80 / 2c`) and `MEM` shows usage over the configured limit. Both are resolved from the catalog's *active* config at read time, so `msb modify --cpus/--memory` on a running sandbox is reflected on the next tick instead of showing the boot-time limit forever.
 
 ## Fixes
 
 **Crashed sandboxes no longer report as running**
 
-A runtime killed hard (SIGKILL, OOM, host reboot) never released its shared-memory metrics slot, so `msb metrics` — and the `msb-metrics` collector — kept reporting its frozen last sample as a running sandbox until slot pressure forced a reclaim. Registry readers now verify the slot owner's PID on every read and retire dead entries on the spot: the CLI reports them as `exited`, and collector export streams drop the series on the next tick.
+A runtime killed hard (SIGKILL, OOM, host reboot) never released its shared-memory metrics slot. As a result, `msb metrics` — and the `msb-metrics` collector — kept reporting its frozen last sample as a running sandbox until slot pressure forced a reclaim. Registry readers now verify the slot owner's PID on every read and retire dead entries on the spot: the CLI reports them as `exited`, and collector export streams drop the series on the next tick.
