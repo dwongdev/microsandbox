@@ -82,19 +82,14 @@ msb modify worker --label tier=web --label-rm stale
 
 ## Select in bulk
 
-This is where labels earn their keep. Every fleet command takes `--label` to act on a whole group at once instead of naming sandboxes one by one. Pass `--label` more than once to require all of them (AND-matched):
-
-```bash
-msb ps --label app=engine                        # list matching sandboxes
-msb stop --label app=engine                       # stop all of them
-msb restart --label app=engine --label tier=web   # only those with both labels
-```
-
-`--label` works the same way on `ps`, `ls`, `start`, `stop`, `restart`, `ping`, `touch`, and `rm`.
-
-From the SDKs, list sandboxes by label:
+This is where labels earn their keep. Find every sandbox carrying a label, from the CLI or an SDK — pass more than one label to require all of them (AND-matched):
 
 <CodeGroup>
+```bash CLI
+msb ps --label app=engine                    # matching sandboxes
+msb ps --label app=engine --label tier=web   # only those with both
+```
+
 ```rust Rust
 let handles = Sandbox::list_with(
     SandboxFilter::new().label("app", "engine"),
@@ -115,6 +110,16 @@ handles, err := m.ListSandboxesWith(ctx,
 )
 ```
 </CodeGroup>
+
+On the CLI, `--label` also drives the fleet commands directly, so you act on the whole group in one call instead of listing and looping:
+
+```bash
+msb stop --label app=engine        # stop every match
+msb restart --label app=engine     # restart every match
+msb rm --force --label app=engine  # remove every match
+```
+
+It works the same on `ps`, `ls`, `start`, `stop`, `restart`, `ping`, `touch`, and `rm`.
 
 ## Attribute metrics
 
