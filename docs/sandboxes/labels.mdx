@@ -6,6 +6,12 @@ icon: "tags"
 
 Labels are `key=value` pairs you attach to a sandbox to organize it. They let you act on many sandboxes at once with a single command, and break metrics down by whatever dimension you choose, such as user, tenant, or job.
 
+## Keys
+
+Label keys cannot start with the reserved prefixes `sandbox.`, `microsandbox.`, or `service.`. Use those namespaces only for attributes microsandbox owns.
+
+Values may be empty. A valueless label such as `--label gpu` is stored as `gpu=""`, matching Docker's label semantics. Use empty values for marker labels, and use explicit values when you need filtering or metrics dimensions such as `user.id=alice` or `tenant=acme`.
+
 ## Add at create time
 
 Attach labels when you create a sandbox. Labels are repeatable, and a bare key with no value is allowed:
@@ -50,6 +56,8 @@ msb create python --name worker \
   --label user.id=alice
 ```
 </CodeGroup>
+
+The OCI image's own labels (`LABEL` instructions, `org.opencontainers.image.*`, etc.) are imported automatically at create time. A label you set yourself overrides the image's value on a key collision. Image labels using a reserved prefix are skipped.
 
 ## Change while running
 
@@ -124,3 +132,5 @@ It works the same on `ps`, `ls`, `start`, `stop`, `restart`, `ping`, `touch`, an
 ## Attribute metrics
 
 Labels flow into a sandbox's metrics as dimensions, so you can break CPU, memory, and I/O down by any label you set, for example per user or per tenant. See [Labels and per-user views](/observability/msb-metrics#labels-and-per-user-views) for the PromQL detail.
+
+High-cardinality labels can increase the number of metric series your backend stores. If an image label carries a commit SHA, build timestamp, or other noisy value, run `msb-metrics` with `--exclude-label-key <key>` to drop that label from exported metrics while keeping it in the catalog. Use `--no-labels` to disable metric labels entirely.

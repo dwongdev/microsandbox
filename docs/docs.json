@@ -40,16 +40,16 @@
               "sandboxes/overview",
               "sandboxes/lifecycle",
               "sandboxes/commands",
-              "sandboxes/ssh",
-              "sandboxes/compute",
-              "sandboxes/labels",
               "sandboxes/secrets",
-              "sandboxes/customize",
               "sandboxes/filesystem",
               "sandboxes/volumes",
               "sandboxes/snapshots",
+              "sandboxes/ssh",
+              "sandboxes/configuration",
+              "sandboxes/customize",
               "sandboxes/logs",
-              "sandboxes/metrics"
+              "sandboxes/metrics",
+              "sandboxes/labels"
             ]
           },
           {
