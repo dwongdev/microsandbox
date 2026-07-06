@@ -542,9 +542,13 @@ for r in &plan.resize_status {
 
 </Accordion>
 
-Start planning a configuration change for this sandbox. The returned builder accumulates a patch (CPUs, memory, env vars, labels, workdir, secrets) and terminates with [`dry_run()`](#dry_run) or [`apply()`](#apply). The resulting [`SandboxModificationPlan`](#sandboxmodificationplan) classifies every requested change as `live`, `next start`, `requires restart`, or `unsupported`, and apply is all-or-nothing. CPU count and memory apply live to a running sandbox when the target fits inside the boot-time capacity ([`max_cpus`](#max_cpus) / [`max_memory`](#max_memory)); raising the capacity itself is restart-backed. See [`SandboxModificationBuilder`](#sandboxmodificationbuilder) for the full builder API and [`msb modify`](/cli/sandbox-commands#msb-modify) for the CLI equivalent.
+Start a configuration change for this sandbox. Set what you want to change (CPUs, memory, env vars, labels, workdir, secrets), then finish with [`dry_run()`](#dry_run) to preview or [`apply()`](#apply) to make it happen. Either way you get a [`SandboxModificationPlan`](#sandboxmodificationplan) that labels each change `live`, `next start`, `requires restart`, or `unsupported`.
 
-The same method is available on [`SandboxHandle`](#sandboxhandle) for callers that don't want to connect first. It never starts a stopped sandbox; changes on a stopped sandbox persist for the next boot.
+Apply is all-or-nothing: if any change cannot be applied, nothing changes.
+
+CPU and memory changes take effect immediately on a running sandbox as long as the new values stay within [`max_cpus`](#max_cpus) / [`max_memory`](#max_memory); raising those limits requires a restart. See [`SandboxModificationBuilder`](#sandboxmodificationbuilder) for all setters and [`msb modify`](/cli/sandbox-commands#msb-modify) for the CLI equivalent.
+
+The same method is available on [`SandboxHandle`](#sandboxhandle) for callers that don't want to connect first. It never starts a stopped sandbox; changes made while it is stopped take effect on the next boot.
 
 <p className="msb-label">Returns</p>
 
@@ -1642,9 +1646,11 @@ Write UTF-8 text content at `path`.
 
 ## SandboxModificationBuilder
 
-Fluent builder for changing an existing sandbox's configuration. Obtained via [`sb.modify()`](#sb-modify) or [`SandboxHandle::modify()`](#sandboxhandle). Setters accumulate a patch; nothing happens until the terminal [`dry_run()`](#dry_run) or [`apply()`](#apply) call. Both return a [`SandboxModificationPlan`](#sandboxmodificationplan) that classifies every requested change as `live`, `next start`, `requires restart`, or `unsupported`.
+Fluent builder for changing an existing sandbox's configuration. Obtained via [`sb.modify()`](#sb-modify) or [`SandboxHandle::modify()`](#sandboxhandle). Nothing happens until you finish with [`dry_run()`](#dry_run) or [`apply()`](#apply); both return a [`SandboxModificationPlan`](#sandboxmodificationplan) that labels each change `live`, `next start`, `requires restart`, or `unsupported`.
 
-Apply is all-or-nothing: a patch with conflicts, unsupported changes, or restart-required changes under the default policy fails without changing anything. CPU count and memory apply live to a running sandbox when the target fits inside the boot-time capacity ([`max_cpus`](#max_cpus) / [`max_memory`](#max_memory)). Raising the capacity itself is restart-backed, so pick capacity headroom at create time. Env and workdir changes on a running sandbox apply to future execs only (running processes keep their current environment), and the plan reports this as a warning. The CLI equivalent is [`msb modify`](/cli/sandbox-commands#msb-modify).
+Apply is all-or-nothing: if any change conflicts, is unsupported, or needs a restart you did not allow, the call fails and nothing changes.
+
+CPU and memory changes take effect immediately on a running sandbox as long as the new values stay within [`max_cpus`](#max_cpus) / [`max_memory`](#max_memory); raising those limits requires a restart, so reserve headroom at create time. Env and workdir changes affect future execs only; running processes keep their current environment (the plan notes this as a warning). The CLI equivalent is [`msb modify`](/cli/sandbox-commands#msb-modify).
 
 #### <span className="msb-recv">.</span><span className="msb-hn">apply()</span>
 
