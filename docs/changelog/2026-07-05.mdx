@@ -12,7 +12,11 @@ icon: "bolt"
 
 **Live modify and resize for running sandboxes**
 
-`msb modify` and `Sandbox::modify()` are now a first-class surface for changing a sandbox in place, on both stopped and running sandboxes. Supported fields are `cpus`, `max_cpus`, `memory`, `max_memory`, `env`, `labels`, `workdir`, and `secrets`. A dry-run planner classifies each change as live, next-start, requires-restart, or unsupported, and `--next-start` and `--restart` policies control when a change is applied. CPU and memory resize happen live within the booted `max_cpus` and `max_memory` ceilings, and secret rotation, addition, and removal are applied to a running sandbox through the host network layer. `msb restart`, `msb touch`, and `msb ping` round out the lifecycle surface.
+`msb modify` and `Sandbox::modify()` can now change a sandbox in place, whether it is stopped or running: CPUs, memory, env vars, labels, workdir, and secrets.
+
+CPU and memory changes apply live, up to the `max_cpus` and `max_memory` ceilings chosen at create time. Secrets can be added, rotated, and removed on a running sandbox. A dry run shows what each change would do before you commit, and `--next-start` / `--restart` control when changes that cannot apply live take effect.
+
+`msb restart`, `msb touch`, and `msb ping` round out the lifecycle commands.
 
 ```bash
 msb modify worker --cpus 2 --memory 1G
@@ -23,7 +27,9 @@ See the [customize sandboxes guide](/sandboxes/customize).
 
 **Sandbox state and resource columns in `msb ps` and `msb metrics`**
 
-`msb ps` now shows each sandbox's CPU and memory allocation as `effective / max`, so you can see current allocation and live-resize headroom at a glance. `msb metrics` gains a `STATE` column (`running`, `stalled`, or `exited`), per-second I/O rates, `--sort cpu|mem`, and `--watch` and `--follow` modes for live monitoring; the Rust SDK exposes the same data via `SandboxMetricsReport`. Crashed runtimes are now demoted from the active view on the next read, so a SIGKILLed sandbox no longer shows as running. Denominators follow live resizes rather than boot-time values.
+`msb ps` now shows each sandbox's CPU and memory allocation as `effective / max`, so you can see current allocation and resize headroom at a glance.
+
+`msb metrics` gains a `STATE` column (`running`, `stalled`, or `exited`), per-second I/O rates, `--sort cpu|mem`, and `--watch` / `--follow` modes for live monitoring; the Rust SDK exposes the same data via `SandboxMetricsReport`. Crashed sandboxes no longer show as running, and CPU and memory readings follow live resizes instead of boot-time values.
 
 ```bash
 msb ps
@@ -35,20 +41,20 @@ See the [sandbox commands reference](/cli/sandbox-commands).
 
 **Host-scoped upstream TLS trust**
 
-The upstream TLS proxy now supports per-host trust controls, so sandboxes can reach self-signed or private HTTPS upstreams and still participate in secret substitution. You can pin a CA bundle to specific hosts, or disable upstream verification for a bounded set of hosts when the endpoint is ephemeral. The controls are wired through the CLI and the Rust, TypeScript, Python, and Go SDKs.
+Sandboxes can now reach self-signed or private HTTPS endpoints without losing secret substitution. Trust is scoped per host: pin a CA bundle to specific hosts, or turn off verification for a bounded set of hosts. Available in the CLI and all four SDKs.
 
 See the [TLS networking guide](/networking/tls).
 
 **Faster `msb load` and `msb pull`**
 
-Repeated `msb load` of an already-materialized image now short-circuits before any layer blob is touched, dropping warm re-load of a 1.3 GB image from ~18–21 seconds to under a second. `msb load` also renders the same progress bars as `msb pull`, including a spinner while a piped `docker save | msb load` streams in. A VMDK FLAT sector-offset fix in `msb-imago` 0.1.1 resolves data corruption in OCI images whose layer EROFS exceeds 2 GiB.
+Loading an image that is already on disk now takes under a second instead of ~20 seconds (measured on a 1.3 GB image). `msb load` also shows the same progress bars as `msb pull`, including while streaming from `docker save | msb load`. A fix in `msb-imago` 0.1.1 resolves data corruption in OCI images with layers over 2 GiB.
 
 See the [image commands reference](/cli/image-commands).
 
 **Other features**
 
-- **`msb self downgrade`.** A new `msb self downgrade <version>` command moves the local install to a supported older release while backing up the SQLite database, rolling back applied migrations, and refusing irreversible schema paths. Targets below 0.6.0 are refused, and `msb self update` stays latest-only. See the [CLI overview](/cli/overview).
-- **`--no-tty` execution mode.** `msb run` and `msb exec` gain `--no-tty` so scripts can force non-interactive, captured execution even when launched from a terminal. The flag cannot be combined with `--tty`, and `msb exec --no-tty` treats terminal stdin as EOF so the buffered path does not block. See the [sandbox commands reference](/cli/sandbox-commands).
+- **`msb self downgrade`.** `msb self downgrade <version>` moves the local install to an older release (0.6.0 or newer), backing up the database and rolling back migrations on the way. `msb self update` stays latest-only. See the [CLI overview](/cli/overview).
+- **`--no-tty` execution mode.** `msb run` and `msb exec` gain `--no-tty` so scripts can force non-interactive, captured execution even when launched from a terminal. See the [sandbox commands reference](/cli/sandbox-commands).
 
 ## Bug fixes
 
