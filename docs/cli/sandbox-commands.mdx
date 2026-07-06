@@ -214,7 +214,7 @@ msb touch --label app=engine
 
 ## msb modify
 
-Change a sandbox's configuration. `msb modify` plans every requested change, classifies each one (live, next start, requires restart, unsupported), and applies all-or-nothing. CPU count and memory apply live to a running sandbox when the target fits inside the boot-time capacity (`max_cpus` / `max_memory`); raising the capacity itself requires a restart or `--next-start`.
+Change a running sandbox's configuration. Every change is planned, labeled (live, next start, requires restart, unsupported), and applied all-or-nothing. CPU and memory apply live within the `max_cpus` / `max_memory` ceilings; raising a ceiling requires `--restart` or `--next-start`.
 
 ```bash
 msb modify api --cpus 4                    # live when 4 <= max_cpus
@@ -224,7 +224,7 @@ msb modify api --max-memory 16G --next-start
 msb modify api --cpus 8 --dry-run          # show the plan, apply nothing
 ```
 
-`max_cpus` and `max_memory` are boot-time reservations chosen at create time. They default to the effective `cpus`/`memory`, which leaves no headroom; live growth beyond them is impossible without a restart. Reserving capacity costs almost nothing (parked vCPUs and lazily-backed memory), so set them above the initial values at create time if the sandbox may need to grow.
+`max_cpus` and `max_memory` are reserved at create time and default to the starting `cpus`/`memory`, leaving no headroom for live growth. Reserving more costs almost nothing, so set them higher at create time if the sandbox may need to grow.
 
 Live resize is not necessarily instant. When an accepted resize has not fully settled, the apply output includes a convergence table with a `STATE` column:
 
@@ -235,9 +235,9 @@ Live resize is not necessarily instant. When an accepted resize has not fully se
 
 JSON output (`--format json`) carries the same states in `resize_status`.
 
-Env and workdir changes on a running sandbox apply to future execs only; running processes keep their current environment. The plan reports this as a warning.
+Env and workdir changes apply to future execs only; running processes keep their current environment.
 
-`--secret NAME@HOST` adds or rotates a secret from the same-named host environment variable, recording a source reference; the value itself never rides in the command. The inline `NAME=VALUE@HOST` form is rejected, same as on `msb create`: shell history and process listings would leak the value, so providing a raw value is SDK-only.
+`--secret NAME@HOST` adds or rotates a secret from the host environment variable of that name; the value never appears in the command. Inline `NAME=VALUE@HOST` is rejected, same as on `msb create`, since it would leak into shell history. To pass a raw value, use an SDK.
 
 | Flag | Description |
 |------|-------------|

@@ -542,13 +542,11 @@ for r in &plan.resize_status {
 
 </Accordion>
 
-Start a configuration change for this sandbox. Set what you want to change (CPUs, memory, env vars, labels, workdir, secrets), then finish with [`dry_run()`](#dry_run) to preview or [`apply()`](#apply) to make it happen. Either way you get a [`SandboxModificationPlan`](#sandboxmodificationplan) that labels each change `live`, `next start`, `requires restart`, or `unsupported`.
+Plan or apply a configuration change. Set what to change (CPUs, memory, env vars, labels, workdir, secrets), then call [`dry_run()`](#dry_run) to preview or [`apply()`](#apply) to commit; both return a [`SandboxModificationPlan`](#sandboxmodificationplan) labeling each change `live`, `next start`, `requires restart`, or `unsupported`. Apply is all-or-nothing.
 
-Apply is all-or-nothing: if any change cannot be applied, nothing changes.
+CPU and memory apply live within the [`max_cpus`](#max_cpus) / [`max_memory`](#max_memory) ceilings; raising a ceiling requires a restart. Env and workdir changes affect future execs only. On a stopped sandbox, changes are saved for the next boot.
 
-CPU and memory changes take effect immediately on a running sandbox as long as the new values stay within [`max_cpus`](#max_cpus) / [`max_memory`](#max_memory); raising those limits requires a restart. See [`SandboxModificationBuilder`](#sandboxmodificationbuilder) for all setters and [`msb modify`](/cli/sandbox-commands#msb-modify) for the CLI equivalent.
-
-The same method is available on [`SandboxHandle`](#sandboxhandle) for callers that don't want to connect first. It never starts a stopped sandbox; changes made while it is stopped take effect on the next boot.
+See [`SandboxModificationBuilder`](#sandboxmodificationbuilder) for all setters and [`msb modify`](/cli/sandbox-commands#msb-modify) for the CLI.
 
 <p className="msb-label">Returns</p>
 
