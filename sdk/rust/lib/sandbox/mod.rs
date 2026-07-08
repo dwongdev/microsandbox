@@ -18,6 +18,7 @@ mod patch;
 #[cfg(feature = "ssh")]
 pub mod ssh;
 mod types;
+pub(crate) mod upper;
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -45,8 +46,8 @@ use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
 
 use microsandbox_image::{
-    Digest, GlobalCache, PullOptions, PullProgressSender, PullResult, Reference, ext4,
-    progress_channel, tree,
+    CachedImageMetadata, Digest, GlobalCache, PullOptions, PullProgressSender, PullResult,
+    Reference, ext4, progress_channel, tree,
 };
 
 use crate::{
@@ -175,6 +176,12 @@ pub(crate) struct RegistryOverrides {
     pub auth: Option<microsandbox_image::RegistryAuth>,
     pub insecure: bool,
     pub ca_certs: Vec<Vec<u8>>,
+}
+
+struct ResolvedOciImage {
+    pull_result: PullResult,
+    metadata_reference: String,
+    cached_metadata: Option<CachedImageMetadata>,
 }
 
 /// Filter for [`Sandbox::list_with`].
@@ -542,14 +549,23 @@ pub(crate) async fn create_local(
             insecure: config.insecure,
             ca_certs: config.ca_certs.clone(),
         };
-        let pull_result = pull_oci_image(
+
+        let ResolvedOciImage {
+            pull_result,
+            metadata_reference,
+            cached_metadata,
+        } = resolve_oci_image_for_create(
             local_backend,
             &reference,
             config.spec.pull_policy,
             overrides,
+            expected_snapshot_manifest_digest.as_deref(),
             progress,
         )
         .await?;
+
+        // A cheap guard: snapshot restores are resolved by the pinned digest,
+        // so this should match unless the cache or registry is inconsistent.
         if let Some(expected) = expected_snapshot_manifest_digest.as_deref()
             && pull_result.manifest_digest.to_string() != expected
         {
@@ -566,7 +582,7 @@ pub(crate) async fn create_local(
         }
 
         pinned_manifest_digest = Some(pull_result.manifest_digest.to_string());
-        pinned_reference = Some(reference.clone());
+        pinned_reference = Some(metadata_reference.clone());
 
         // Verify VMDK exists in the global cache.
         let cache_dir = local_backend.cache_dir();
@@ -619,12 +635,23 @@ pub(crate) async fn create_local(
         // Store manifest digest for spawn to derive paths.
         config.manifest_digest = Some(pull_result.manifest_digest.to_string());
 
-        // Persist full image metadata to database.
-        if let Ok(image_ref) = reference.parse::<Reference>() {
+        // Persist under the immutable digest-pinned reference on snapshot
+        // restore, even when the matching metadata was found under an old tag.
+        if let Some(metadata) = cached_metadata {
+            if let Err(e) =
+                crate::image::Image::persist(local_backend, &metadata_reference, metadata).await
+            {
+                tracing::warn!(
+                    error = %e,
+                    "failed to persist image metadata to database"
+                );
+            }
+        } else if let Ok(image_ref) = metadata_reference.parse::<Reference>() {
             match cache.read_image_metadata_async(&image_ref).await {
                 Ok(Some(metadata)) => {
                     if let Err(e) =
-                        crate::image::Image::persist(local_backend, &reference, metadata).await
+                        crate::image::Image::persist(local_backend, &metadata_reference, metadata)
+                            .await
                     {
                         tracing::warn!(
                             error = %e,
@@ -937,6 +964,11 @@ pub(crate) async fn stop_local(
             })?;
     let (model, pid) = get_local_handle_state(local_backend, name).await?;
     if model.status != SandboxStatus::Running && model.status != SandboxStatus::Draining {
+        // A terminal row can still be backed by a leaked VM process on
+        // Windows; stopping an "already stopped" sandbox must still leave no
+        // process serving its agent pipes.
+        #[cfg(windows)]
+        reap_leaked_runtime_process(local_backend, model.id, name).await?;
         return Ok(());
     }
 
@@ -957,8 +989,23 @@ pub(crate) async fn stop_local(
                 error = %e,
                 "stop_local: agent endpoint unreachable; falling back to process termination",
             );
+            #[cfg(unix)]
             if let Some(pid) = pid.filter(|p| pid_is_alive(*p)) {
                 terminate_pid_gracefully(pid)?;
+            }
+            // An unreachable agent pipe often means the runtime already died
+            // and the PID was recycled; the identity-checked reap avoids
+            // TerminateProcess on an innocent process.
+            #[cfg(windows)]
+            match reap_leaked_runtime_process(local_backend, model.id, name).await? {
+                LeakedReapVerdict::NoProcess | LeakedReapVerdict::RecycledPid => {}
+                LeakedReapVerdict::Unverifiable => {
+                    let pid = pid.map_or_else(|| "unknown".to_string(), |p| p.to_string());
+                    return Err(crate::MicrosandboxError::Runtime(format!(
+                        "cannot stop sandbox '{name}': recorded process {pid} is alive but not \
+                         queryable (possibly running elevated); terminate it manually"
+                    )));
+                }
             }
             Ok(())
         }
@@ -983,36 +1030,70 @@ pub(crate) async fn kill_local(
             })?;
     let (model, pid) = get_local_handle_state(local_backend, name).await?;
     if model.status != SandboxStatus::Running && model.status != SandboxStatus::Draining {
+        // Windows: a terminal row can still be backed by a leaked VM process
+        // (guest poweroff recorded, process never exited). Force-stop must
+        // free the agent pipes even in that state.
+        #[cfg(windows)]
+        reap_leaked_runtime_process(local_backend, model.id, name).await?;
         return Ok(());
     }
 
-    let mut pids = Vec::new();
-    if let Some(pid) = pid.filter(|p| pid_is_alive(*p)) {
-        kill_pid(pid)?;
-        pids.push(pid);
-    }
-
-    if !pids.is_empty() {
-        let timeout = std::time::Duration::from_secs(5);
-        let start = std::time::Instant::now();
-        let poll_interval = std::time::Duration::from_millis(50);
-        while start.elapsed() < timeout {
-            if pids.iter().all(|pid| pid_is_dead_or_reaped(*pid)) {
-                break;
+    // Windows: identity-checked termination instead of a blind
+    // TerminateProcess. A recycled PID must not be killed — and a recycled PID
+    // also proves the runtime is gone, so the row can be marked Stopped either
+    // way. The reap waits for process exit and errors if it survives.
+    #[cfg(windows)]
+    {
+        match reap_leaked_runtime_process(local_backend, model.id, name).await? {
+            LeakedReapVerdict::NoProcess | LeakedReapVerdict::RecycledPid => {}
+            // An active run whose live PID we cannot even query may still be
+            // the runtime (e.g. spawned elevated); claiming Stopped here would
+            // hide a process we did not kill.
+            LeakedReapVerdict::Unverifiable => {
+                let pid = pid.map_or_else(|| "unknown".to_string(), |p| p.to_string());
+                return Err(crate::MicrosandboxError::Runtime(format!(
+                    "cannot terminate sandbox '{name}': recorded process {pid} is alive but not \
+                     queryable (possibly running elevated); terminate it manually"
+                )));
             }
-            tokio::time::sleep(poll_interval).await;
         }
-    }
-
-    let all_dead = pids.is_empty() || pids.iter().all(|pid| pid_is_dead_or_reaped(*pid));
-    if all_dead {
         let db = local_backend.db().await?.write();
         if let Err(e) = update_sandbox_status(db, model.id, SandboxStatus::Stopped).await {
             tracing::warn!(sandbox = %name, error = %e, "failed to update sandbox status after kill");
         }
+        Ok(())
     }
 
-    Ok(())
+    #[cfg(unix)]
+    {
+        let mut pids = Vec::new();
+        if let Some(pid) = pid.filter(|p| pid_is_alive(*p)) {
+            kill_pid(pid)?;
+            pids.push(pid);
+        }
+
+        if !pids.is_empty() {
+            let timeout = std::time::Duration::from_secs(5);
+            let start = std::time::Instant::now();
+            let poll_interval = std::time::Duration::from_millis(50);
+            while start.elapsed() < timeout {
+                if pids.iter().all(|pid| pid_is_dead_or_reaped(*pid)) {
+                    break;
+                }
+                tokio::time::sleep(poll_interval).await;
+            }
+        }
+
+        let all_dead = pids.is_empty() || pids.iter().all(|pid| pid_is_dead_or_reaped(*pid));
+        if all_dead {
+            let db = local_backend.db().await?.write();
+            if let Err(e) = update_sandbox_status(db, model.id, SandboxStatus::Stopped).await {
+                tracing::warn!(sandbox = %name, error = %e, "failed to update sandbox status after kill");
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Local lifecycle: drain a running sandbox by name.
@@ -1059,6 +1140,108 @@ pub(crate) async fn drain_local(
         }
         Ok(())
     }
+}
+
+/// What [`reap_leaked_runtime_process`] established about the recorded run PID.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LeakedReapVerdict {
+    /// No live runtime process remains (already dead, or terminated here).
+    NoProcess,
+
+    /// A live process holds the PID but is provably not the runtime; it was left alone. The
+    /// runtime itself is therefore gone.
+    RecycledPid,
+
+    /// The PID names a live process that could not be queried, so ownership is unknown; it was
+    /// left alone. Usually a recycled PID landing on a protected/other-user process, but callers
+    /// holding an *active* run should treat this as "may still be running".
+    Unverifiable,
+}
+
+/// Terminate a leftover VM process for this sandbox when the most recent run's
+/// PID still names a live process that provably is the sandbox runtime.
+///
+/// Windows-only: a guest poweroff can be recorded in the database (run
+/// terminated, sandbox stopped) while the host VM process never finishes
+/// exiting, silently keeping the name-derived agent pipes served. Every
+/// lifecycle operation that promises "no process remains" (stop, force-kill,
+/// remove) funnels through here. Identity is validated against the run row
+/// (creation time no later than `started_at`, image name `msb`) so a recycled
+/// PID is never killed.
+///
+/// Returns an error when a validated runtime process survives the termination
+/// wait; callers must not delete sandbox state in that case.
+#[cfg(windows)]
+pub(crate) async fn reap_leaked_runtime_process(
+    local_backend: &crate::backend::LocalBackend,
+    sandbox_id: i32,
+    name: &str,
+) -> MicrosandboxResult<LeakedReapVerdict> {
+    use crate::runtime::reap;
+
+    let pools = local_backend.db().await?;
+    let run = run_entity::Entity::find()
+        .filter(run_entity::Column::SandboxId.eq(sandbox_id))
+        .order_by_desc(run_entity::Column::Id)
+        .one(pools.read())
+        .await?;
+    let Some(run) = run else {
+        return Ok(LeakedReapVerdict::NoProcess);
+    };
+    let (Some(pid), Some(started_at)) = (run.pid, run.started_at) else {
+        return Ok(LeakedReapVerdict::NoProcess);
+    };
+    let Ok(pid_u32) = u32::try_from(pid) else {
+        return Ok(LeakedReapVerdict::NoProcess);
+    };
+    if !pid_is_alive(pid) {
+        return Ok(LeakedReapVerdict::NoProcess);
+    }
+
+    let outcome =
+        reap::terminate_runtime_process_checked(pid_u32, started_at.and_utc().timestamp_micros());
+    match outcome {
+        Ok(reap::ReapOutcome::AlreadyDead) => return Ok(LeakedReapVerdict::NoProcess),
+        Ok(reap::ReapOutcome::IdentityMismatch) => {
+            tracing::warn!(
+                pid,
+                sandbox = %name,
+                "recorded runtime PID is now a different process (recycled); leaving it alone"
+            );
+            return Ok(LeakedReapVerdict::RecycledPid);
+        }
+        Ok(reap::ReapOutcome::Unverifiable) => {
+            tracing::warn!(
+                pid,
+                sandbox = %name,
+                "recorded runtime PID cannot be queried (likely recycled); leaving it alone"
+            );
+            return Ok(LeakedReapVerdict::Unverifiable);
+        }
+        Ok(reap::ReapOutcome::Terminated) => {
+            tracing::warn!(pid, sandbox = %name, "terminated leftover sandbox VM process");
+        }
+        // Terminate failed on a *verified* runtime process. It may be mid-exit
+        // (an exiting process can reject TerminateProcess); the liveness wait
+        // below is the real arbiter.
+        Err(err) => {
+            tracing::warn!(
+                pid,
+                sandbox = %name,
+                error = %err,
+                "failed to terminate leftover sandbox VM process; waiting for exit"
+            );
+        }
+    }
+
+    wait_for_pids_to_exit(&[pid], reap::REAP_EXIT_WAIT).await;
+    if pid_is_alive(pid) {
+        return Err(crate::MicrosandboxError::Runtime(format!(
+            "sandbox process {pid} for '{name}' is still running after termination"
+        )));
+    }
+    Ok(LeakedReapVerdict::NoProcess)
 }
 
 async fn request_agent_shutdown(
@@ -1373,6 +1556,10 @@ impl Sandbox {
         self.request_stop().await?;
         if let Ok(result) = tokio::time::timeout(timeout, self.wait_until_stopped()).await {
             result?;
+            // Windows: the DB can record the guest poweroff while the VM
+            // process never exits; a successful stop must mean "no process".
+            #[cfg(windows)]
+            self.reap_leaked_local_runtime().await?;
             return Ok(());
         }
 
@@ -1392,6 +1579,21 @@ impl Sandbox {
                 self.name
             ))),
         }
+    }
+
+    /// Kill any leftover VM process still backing this local sandbox after
+    /// its DB row went terminal. No-op for cloud sandboxes.
+    #[cfg(windows)]
+    async fn reap_leaked_local_runtime(&self) -> MicrosandboxResult<()> {
+        let Some(local) = self.local() else {
+            return Ok(());
+        };
+        let Some(local_backend) = self.backend.as_local() else {
+            return Ok(());
+        };
+        reap_leaked_runtime_process(local_backend, local.db_id, &self.name)
+            .await
+            .map(|_| ())
     }
 
     /// Stop the sandbox gracefully and wait for the process to exit.
@@ -2346,11 +2548,6 @@ fn pid_is_dead_or_reaped(pid: i32) -> bool {
     !pid_is_alive(pid)
 }
 
-#[cfg(windows)]
-fn pid_is_dead_or_reaped(pid: i32) -> bool {
-    !pid_is_alive(pid)
-}
-
 #[cfg(unix)]
 fn terminate_pid_gracefully(pid: i32) -> MicrosandboxResult<()> {
     nix::sys::signal::kill(
@@ -2424,6 +2621,149 @@ pub(crate) fn hostname_from_sandbox_name(name: &str) -> String {
     derive_hostname(name)
 }
 
+/// Build a digest-pinned OCI reference (`<registry>/<repo>@<digest>`) from a
+/// reference and a manifest digest, so restore fetches the base image by exact
+/// content rather than re-resolving the tag.
+fn digest_pinned_reference(reference: &str, pinned_digest: &str) -> MicrosandboxResult<String> {
+    let parsed: Reference = reference.parse().map_err(|e| {
+        crate::MicrosandboxError::InvalidConfig(format!("invalid image reference: {e}"))
+    })?;
+
+    Ok(Reference::with_digest(
+        parsed.registry().to_string(),
+        parsed.repository().to_string(),
+        pinned_digest.to_string(),
+    )
+    .whole())
+}
+
+async fn resolve_oci_image_for_create(
+    local_backend: &crate::backend::LocalBackend,
+    reference: &str,
+    pull_policy: PullPolicy,
+    registry_overrides: RegistryOverrides,
+    expected_snapshot_manifest_digest: Option<&str>,
+    progress: Option<PullProgressSender>,
+) -> MicrosandboxResult<ResolvedOciImage> {
+    let Some(pinned_digest) = expected_snapshot_manifest_digest else {
+        let pull_result = pull_oci_image(
+            local_backend,
+            reference,
+            pull_policy,
+            registry_overrides,
+            progress,
+        )
+        .await?;
+        return Ok(ResolvedOciImage {
+            pull_result,
+            metadata_reference: reference.to_string(),
+            cached_metadata: None,
+        });
+    };
+
+    resolve_snapshot_oci_image(
+        local_backend,
+        reference,
+        pinned_digest,
+        pull_policy,
+        registry_overrides,
+        progress,
+    )
+    .await
+}
+
+async fn resolve_snapshot_oci_image(
+    local_backend: &crate::backend::LocalBackend,
+    reference: &str,
+    pinned_digest: &str,
+    pull_policy: PullPolicy,
+    registry_overrides: RegistryOverrides,
+    progress: Option<PullProgressSender>,
+) -> MicrosandboxResult<ResolvedOciImage> {
+    let manifest_digest: Digest = pinned_digest.parse().map_err(|e| {
+        crate::MicrosandboxError::SnapshotIntegrity(format!(
+            "invalid snapshot image digest {pinned_digest}: {e}"
+        ))
+    })?;
+    let pinned_reference = digest_pinned_reference(reference, pinned_digest)?;
+    let cache = GlobalCache::new_async(&local_backend.cache_dir()).await?;
+
+    if let Some((pull_result, metadata)) =
+        Registry::pull_cached_by_manifest_digest(&cache, &manifest_digest).await?
+    {
+        emit_cached_pull_progress(progress.as_ref(), reference, &metadata);
+        return Ok(ResolvedOciImage {
+            pull_result,
+            metadata_reference: pinned_reference,
+            cached_metadata: Some(metadata),
+        });
+    }
+
+    if pull_policy == PullPolicy::Never {
+        return Err(crate::MicrosandboxError::SnapshotIntegrity(format!(
+            "snapshot base image {pinned_digest} is not cached locally and pull policy is `never`; \
+             this snapshot cannot be restored losslessly"
+        )));
+    }
+
+    // A snapshot's overlay is bound to the exact base image it was captured on,
+    // so restore pulls that base by its pinned digest; a tag could resolve to
+    // different content. Fresh creates still pull the tag.
+    let pull_result = match pull_oci_image(
+        local_backend,
+        &pinned_reference,
+        pull_policy,
+        registry_overrides,
+        progress,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(err) => {
+            return Err(crate::MicrosandboxError::SnapshotIntegrity(format!(
+                "snapshot base image {pinned_digest} no longer available in registry \
+                 (it may have been garbage-collected upstream); this snapshot \
+                 cannot be restored losslessly: {err}"
+            )));
+        }
+    };
+
+    Ok(ResolvedOciImage {
+        pull_result,
+        metadata_reference: pinned_reference,
+        cached_metadata: None,
+    })
+}
+
+fn emit_cached_pull_progress(
+    progress: Option<&PullProgressSender>,
+    reference: &str,
+    metadata: &CachedImageMetadata,
+) {
+    let Some(sender) = progress else {
+        return;
+    };
+
+    let reference: std::sync::Arc<str> = reference.to_string().into();
+    sender.send(PullProgress::Resolving {
+        reference: reference.clone(),
+    });
+    sender.send(PullProgress::Resolved {
+        reference: reference.clone(),
+        manifest_digest: metadata.manifest_digest.clone().into(),
+        layer_count: metadata.layers.len(),
+        total_download_bytes: metadata
+            .layers
+            .iter()
+            .filter_map(|layer| layer.size_bytes)
+            .reduce(|a, b| a + b),
+    });
+    sender.send(PullProgress::Complete {
+        reference,
+        layer_count: metadata.layers.len(),
+    });
+}
+
 /// Pull an OCI image and return the pull result.
 ///
 /// Auth resolution:
@@ -2457,27 +2797,7 @@ async fn pull_oci_image(
     // constructing the registry client when the image is already complete
     // in the local cache.
     if let Some((result, metadata)) = Registry::pull_cached(&cache, &image_ref, &options)? {
-        if let Some(sender) = progress {
-            let reference: std::sync::Arc<str> = reference.to_string().into();
-            sender.send(PullProgress::Resolving {
-                reference: reference.clone(),
-            });
-            sender.send(PullProgress::Resolved {
-                reference: reference.clone(),
-                manifest_digest: metadata.manifest_digest.clone().into(),
-                layer_count: metadata.layers.len(),
-                total_download_bytes: metadata
-                    .layers
-                    .iter()
-                    .filter_map(|layer| layer.size_bytes)
-                    .reduce(|a, b| a + b),
-            });
-            sender.send(PullProgress::Complete {
-                reference,
-                layer_count: metadata.layers.len(),
-            });
-        }
-
+        emit_cached_pull_progress(progress.as_ref(), reference, &metadata);
         return Ok(result);
     }
 
@@ -2956,6 +3276,7 @@ mod tests {
 
     use microsandbox_db::entity::{run as run_entity, sandbox_rootfs as sandbox_rootfs_entity};
     use microsandbox_db::pool::DbPools;
+    use microsandbox_image::{CachedImageMetadata, CachedLayerMetadata, GlobalCache, ImageConfig};
 
     use crate::{
         backend::{Backend, LocalBackend},
@@ -2968,12 +3289,135 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        MAX_HOSTNAME_BYTES, MAX_SANDBOX_NAME_BYTES, MountOptions, RootfsSource, SandboxConfig,
-        SandboxStatus, VolumeMount, ephemeral_cleanup_stop_result, hostname_from_sandbox_name,
-        insert_sandbox_record, persist_oci_manifest_pin, prepare_create_target,
-        reconcile_sandbox_runtime_state, remove_dir_if_exists, sandbox_not_found_for_name,
+        MAX_HOSTNAME_BYTES, MAX_SANDBOX_NAME_BYTES, MountOptions, PullPolicy, RegistryOverrides,
+        RootfsSource, SandboxConfig, SandboxStatus, VolumeMount, digest_pinned_reference,
+        ephemeral_cleanup_stop_result, hostname_from_sandbox_name, insert_sandbox_record,
+        persist_oci_manifest_pin, prepare_create_target, reconcile_sandbox_runtime_state,
+        remove_dir_if_exists, resolve_snapshot_oci_image, sandbox_not_found_for_name,
         validate_hostname, validate_rootfs_source,
     };
+
+    const TEST_DIGEST: &str =
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    const TEST_LAYER_DIFF_ID: &str =
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+
+    #[test]
+    fn test_digest_pinned_reference_from_tag() {
+        // A tag reference is rewritten to a digest reference.
+        let pinned = digest_pinned_reference("python:3.12", TEST_DIGEST).unwrap();
+        assert_eq!(pinned, format!("docker.io/library/python@{TEST_DIGEST}"));
+        assert!(pinned.contains('@'));
+        assert!(!pinned.contains("3.12"));
+    }
+
+    #[test]
+    fn test_digest_pinned_reference_preserves_registry_and_repository() {
+        let pinned = digest_pinned_reference("ghcr.io/acme/app:v1", TEST_DIGEST).unwrap();
+        assert_eq!(pinned, format!("ghcr.io/acme/app@{TEST_DIGEST}"));
+    }
+
+    #[test]
+    fn test_digest_pinned_reference_rejects_invalid_reference() {
+        assert!(digest_pinned_reference("", TEST_DIGEST).is_err());
+    }
+
+    async fn seed_tag_keyed_snapshot_base_cache(
+        cache: &GlobalCache,
+        reference: &microsandbox_image::Reference,
+    ) -> CachedImageMetadata {
+        let metadata = CachedImageMetadata {
+            manifest_digest: TEST_DIGEST.to_string(),
+            config_digest:
+                "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+                    .to_string(),
+            raw_manifest_json: r#"{"schemaVersion":2,"layers":[]}"#.to_string(),
+            raw_config_json:
+                r#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]}}"#
+                    .to_string(),
+            config: ImageConfig {
+                env: vec!["PATH=/usr/bin".into()],
+                ..Default::default()
+            },
+            layers: vec![CachedLayerMetadata {
+                digest: "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+                    .to_string(),
+                media_type: Some("application/vnd.oci.image.layer.v1.tar+gzip".into()),
+                size_bytes: Some(4096),
+                diff_id: TEST_LAYER_DIFF_ID.to_string(),
+            }],
+        };
+
+        cache
+            .write_image_metadata_async(reference, &metadata)
+            .await
+            .unwrap();
+
+        let manifest_digest = TEST_DIGEST.parse().unwrap();
+        let layer_diff_id = TEST_LAYER_DIFF_ID.parse().unwrap();
+        // Snapshot restores need the fully materialized cache, not just metadata.
+        std::fs::write(cache.layer_erofs_path(&layer_diff_id), vec![0u8; 4096]).unwrap();
+        std::fs::write(cache.fsmeta_erofs_path(&manifest_digest), vec![0u8; 4096]).unwrap();
+        std::fs::write(cache.vmdk_path(&manifest_digest), b"# VMDK fixture").unwrap();
+
+        metadata
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_restore_resolves_tag_keyed_cache_by_pinned_digest() {
+        let temp = tempdir().unwrap();
+        let local = LocalBackend::builder()
+            .home(temp.path().join("home"))
+            .build()
+            .await
+            .unwrap();
+        let cache = GlobalCache::new(&local.cache_dir()).unwrap();
+        let tag_reference: microsandbox_image::Reference =
+            "docker.io/library/python:3.12".parse().unwrap();
+        let metadata = seed_tag_keyed_snapshot_base_cache(&cache, &tag_reference).await;
+        let digest_reference = digest_pinned_reference(&tag_reference.to_string(), TEST_DIGEST)
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        assert!(
+            cache
+                .read_image_metadata_async(&digest_reference)
+                .await
+                .unwrap()
+                .is_none(),
+            "fixture should only be cached under the mutable tag key"
+        );
+
+        let resolved = resolve_snapshot_oci_image(
+            &local,
+            &tag_reference.to_string(),
+            TEST_DIGEST,
+            PullPolicy::Never,
+            RegistryOverrides {
+                auth: None,
+                insecure: false,
+                ca_certs: Vec::new(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(resolved.pull_result.cached);
+        assert_eq!(
+            resolved.pull_result.manifest_digest.to_string(),
+            TEST_DIGEST
+        );
+        assert_eq!(
+            resolved.metadata_reference,
+            format!("docker.io/library/python@{TEST_DIGEST}")
+        );
+        assert_eq!(
+            resolved.cached_metadata.unwrap().manifest_digest,
+            metadata.manifest_digest
+        );
+    }
 
     /// Open both pools at `db_path` for tests, with migrations applied.
     async fn open_test_pools(db_path: &std::path::Path) -> DbPools {
