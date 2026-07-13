@@ -47,7 +47,7 @@ Rotating and removing secrets on a live sandbox is now available in the TypeScri
 
 **Offline OCI upper growth**
 
-`msb modify --oci-upper-size` (and the new `--root-disk` size form) now grows the writable ext4 upper without `resize2fs` or any external tooling, using a pure-Rust resizer that works on macOS, Linux, and Windows hosts. New images reserve about 2 TiB of growth headroom; older images can still grow within their existing slack. Stopped sandboxes grow before the size is persisted, running sandboxes grow via `--restart` or on the next start with `--next-start`, and shrink is rejected. Growth includes crash-safe ordering and journal replay for images that were mounted before, so a fresh grow is safe even without a clean guest shutdown.
+`msb modify --oci-upper-size` and the new `--root-disk` size form now grow the writable ext4 upper without `resize2fs` or any external tooling. A pure-Rust resizer handles this on macOS, Linux, and Windows hosts. New images reserve about 2 TiB of growth headroom; older images can still grow within their existing slack. Stopped sandboxes grow before the size is persisted, running sandboxes grow via `--restart` or on the next start with `--next-start`, and shrink is rejected. Growth includes crash-safe ordering and journal replay for images that were mounted before, so a fresh grow is safe even without a clean guest shutdown.
 
 **Clean guest shutdown**
 
@@ -55,7 +55,7 @@ Rotating and removing secrets on a live sandbox is now available in the TypeScri
 
 **`update`, `upgrade`, and `downgrade` at the top level**
 
-`msb update`, `msb upgrade`, and `msb downgrade` are now top-level aliases for the existing `msb self update` and `msb self downgrade` flows, matching the shorter commands people already reach for from other package managers. See the [CLI overview](/cli/overview).
+`msb update`, `msb upgrade`, and `msb downgrade` are now top-level aliases for the existing `msb self update` and `msb self downgrade` flows. They match the shorter commands you already reach for from other package managers. See the [CLI overview](/cli/overview).
 
 **Other features**
 
@@ -64,7 +64,7 @@ Rotating and removing secrets on a live sandbox is now available in the TypeScri
 
 ## Bug fixes
 
-- Windows sandbox teardown no longer leaves the runtime process alive when Windows Hypervisor Platform shutdown stalls. `msb stop`, `msb kill`, and `msb remove` now verify the process identity by creation time and image name before terminating it, so recycled PIDs are never touched and future same-named sandboxes reach a fresh VM instead of a stale named pipe.
+- Windows sandbox teardown no longer leaves the runtime process alive when Windows Hypervisor Platform shutdown stalls. `msb stop`, `msb kill`, and `msb remove` now verify the process identity by creation time and image name before terminating it. Recycled PIDs are never touched, and future same-named sandboxes reach a fresh VM instead of a stale named pipe.
 - Passthrough virtiofs mounts survive host file-descriptor exhaustion. Large directory listings and heavy concurrent I/O no longer stall the sandbox when the host runs out of open file slots.
 - `msb exec` no longer stalls on very large directories. `readdir` results are streamed page by page instead of collected into a single response, so listing directories with many entries returns promptly.
 - Guest paths in the SDKs are now typed as plain strings, so paths sent from a Windows host to a Linux guest are no longer mangled by host path rules. Existing callers that were already passing strings continue to work; typed `Path` values must be converted to strings.
